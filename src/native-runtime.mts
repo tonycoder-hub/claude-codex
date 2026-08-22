@@ -1,3 +1,12 @@
+import { existsSync, realpathSync, readdirSync, mkdirSync, copyFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+// Extended cache TTL for 1-hour prompt caching
+if (!process.env.ANTHROPIC_BETAS) {
+  process.env.ANTHROPIC_BETAS = 'extended-cache-ttl-2025-04-11'
+} else if (!process.env.ANTHROPIC_BETAS.includes('extended-cache-ttl-2025-04-11')) {
+  process.env.ANTHROPIC_BETAS = `${process.env.ANTHROPIC_BETAS},extended-cache-ttl-2025-04-11`
+}
 // In-process Claude runtime — replaces the Python sidecar entirely. Talks to
 // @anthropic-ai/claude-agent-sdk directly so we get a single process boundary
 // (Codex App ⇄ adapter), faster cold-starts, and no JSONL bridge to maintain.
@@ -220,9 +229,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (context.model) opts.model = context.model
     if (context.effort) opts.effort = context.effort
-    const resume = sdkResumeSessionId(context.claudeSessionId)
+    const resume = sdkResumeSessionId(context.claudeSessionId, context.cwd)
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
+
+    // Ensure extended cache TTL is explicitly requested
+    if (!process.env.ANTHROPIC_BETAS) {
+      process.env.ANTHROPIC_BETAS = 'extended-cache-ttl-2025-04-11'
+    }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0)
       opts.allowedTools = context.allowedTools
@@ -662,9 +676,61 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
-export function sdkResumeSessionId(value: string | null): string | null {
+export function sdkResumeSessionId(value: string | null, cwd?: string): string | null {
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
+  if (cwd) {
+    const home = homedir()
+    const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, "-")
+    const slugs = [slug(cwd)]
+    try {
+      const real = realpathSync(cwd)
+      if (real !== cwd) slugs.push(slug(real))
+    } catch {}
+
+    const configRoots = [join(home, ".claude")]
+    const routerRoot = join(home, ".cache", "paseo", "claude-router")
+    if (existsSync(routerRoot)) {
+      try {
+        for (const sub of readdirSync(routerRoot)) {
+          configRoots.push(join(routerRoot, sub))
+        }
+      } catch {}
+    }
+
+    let sourceFile: string | null = null
+    for (const root of configRoots) {
+      for (const s of slugs) {
+        const p = join(root, "projects", s, value + ".jsonl")
+        if (existsSync(p)) {
+          sourceFile = p
+          break
+        }
+      }
+      if (sourceFile) break
+      const sessFile = join(root, "sessions", value + ".jsonl")
+      if (existsSync(sessFile)) {
+        sourceFile = sessFile
+        break
+      }
+    }
+
+    if (!sourceFile) return null
+
+    for (const root of configRoots) {
+      for (const s of slugs) {
+        const targetDir = join(root, "projects", s)
+        const targetFile = join(targetDir, value + ".jsonl")
+        if (targetFile === sourceFile) continue
+        try {
+          if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true })
+          if (!existsSync(targetFile)) {
+            copyFileSync(sourceFile, targetFile)
+          }
+        } catch {}
+      }
+    }
+  }
   return value
 }
 

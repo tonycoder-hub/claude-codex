@@ -352,6 +352,13 @@ export function resolveClaudeModel(
   const envAliases = parseJsonObject(process.env.CLAUDE_CODEX_MODEL_ALIASES)
   const mapped = typeof envAliases[raw] === 'string' ? envAliases[raw] : aliases[raw]
   if (mapped) return mapped
+  // Case-insensitive match against configured models (e.g. GLM-5.3 -> glm-5.3)
+  const configured = process.env.CLAUDE_CODEX_MODELS
+  if (configured) {
+    const list = configured.split(',').map((s) => s.trim()).filter(Boolean)
+    const matched = list.find((m) => m.toLowerCase() === raw.toLowerCase())
+    if (matched) return matched
+  }
   if (isNativeClaudeModel(raw)) return raw
   return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
 }
@@ -434,15 +441,8 @@ function parseJsonObject(raw: string | undefined): Record<string, unknown> {
   }
 }
 
-function isNativeClaudeModel(model: string): boolean {
-  return (
-    model.startsWith('claude-') ||
-    model === 'sonnet' ||
-    model === 'opus' ||
-    model === 'haiku' ||
-    model === 'sonnet[1m]' ||
-    model === 'opusplan'
-  )
+function isNativeClaudeModel(_model: string): boolean {
+  return true
 }
 
 export function isCodexOpenAiModel(model: string): boolean {

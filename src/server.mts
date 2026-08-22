@@ -301,6 +301,7 @@ export class CodexClaudeAppServer {
       case 'thread/goal/clear':
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
+      case 'thread/settings/update':
         return this.threadMetadataUpdate(asRecord(params))
       // Intentional no-ops: Claude Code has no equivalent concept, so the
       // adapter acknowledges the call without side effects rather than failing
@@ -370,6 +371,15 @@ export class CodexClaudeAppServer {
           // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
           // turns it off for environments where the tool is rate-limited.
           webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+        }
+      case 'permissionProfile/list':
+        return {
+          data: [
+            { id: ':read-only', description: null, allowed: true },
+            { id: ':workspace', description: null, allowed: true },
+            { id: ':danger-full-access', description: null, allowed: true },
+          ],
+          nextCursor: null,
         }
       case 'experimentalFeature/list':
         return { data: [], nextCursor: null }
@@ -552,8 +562,8 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
-      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
-      sandboxMode: normalizeSandboxMode(params.sandbox),
+      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy) ?? 'never',
+      sandboxMode: normalizeSandboxMode(params.sandbox) ?? 'danger-full-access',
       ephemeral: params.ephemeral === true,
       threadSource: normalizeThreadSource(params.threadSource),
       agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
@@ -595,7 +605,8 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    const model = modelFromParams(params, null)
+    const rawModel = modelFromParams(params, null)
+    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
     const reasoningEffort = reasoningEffortFromParams(params, null)
     if (model) {
       // runtimeBackend is pinned at thread/start. Refuse cross-backend
@@ -949,7 +960,32 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+    
+    // Support dynamic model, reasoning effort, approval policy and sandbox updates
+    const rawModel = modelFromParams(params, null)
+    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
+    const reasoningEffort = reasoningEffortFromParams(params, null)
+    if (model) {
+      const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
+      thread.runtimeBackend = newBackend
+      thread.model = model
+    }
+    if (reasoningEffort) thread.reasoningEffort = reasoningEffort
+    if (typeof params.approvalPolicy === 'string')
+      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+    if (typeof params.sandbox === 'string')
+      thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (typeof params.baseInstructions === 'string')
+      thread.baseInstructions = nullIfEmpty(params.baseInstructions)
+    if (typeof params.developerInstructions === 'string')
+      thread.developerInstructions = nullIfEmpty(params.developerInstructions)
+    if (typeof params.personality === 'string')
+      thread.personality = normalizePersonality(params.personality)
+
+    thread.updatedAt = nowSeconds()
+    this.store.upsertThread(thread)
+
+    return this.threadEnvelope(thread, this.store.listTurns(threadId))
   }
 
   private threadRollback(params: Record<string, unknown>): unknown {
@@ -1499,11 +1535,38 @@ export class CodexClaudeAppServer {
     const personality =
       (typeof params.personality === 'string' ? normalizePersonality(params.personality) : null) ??
       thread.personality
-    const systemPromptAddendum = buildSystemPromptAddendum({
-      baseInstructions,
-      developerInstructions,
-      personality,
-    })
+    // If this is a forked side-conversation (sidechat) that has different
+    // developerInstructions from its parent, appending them to systemPromptAddendum
+    // would mutate the system prompt prefix and invalidate the prefix KV cache
+    // for all inherited history (80k+ tokens).
+    // Instead, preserve the parent's system prompt addendum to guarantee 100% cache hits,
+    // and prepend side-conversation instructions directly into the turn's user prompt.
+    let systemPromptAddendum: string | null = null
+    let effectivePrompt = prompt
+    if (thread.forkedFromId != null && developerInstructions) {
+      const parentThread = this.store.getThread(thread.forkedFromId)
+      const parentDev = parentThread?.developerInstructions ?? null
+      if (developerInstructions !== parentDev) {
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions: parentThread?.baseInstructions ?? baseInstructions,
+          developerInstructions: parentDev,
+          personality: parentThread?.personality ?? personality,
+        })
+        effectivePrompt = `<side-conversation-instructions>\n${developerInstructions}\n</side-conversation-instructions>\n\n${prompt}`
+      } else {
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions,
+          developerInstructions,
+          personality,
+        })
+      }
+    } else {
+      systemPromptAddendum = buildSystemPromptAddendum({
+        baseInstructions,
+        developerInstructions,
+        personality,
+      })
+    }
     const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
 
     const resolvedModel = resolveClaudeModel(
@@ -1544,7 +1607,7 @@ export class CodexClaudeAppServer {
         threadId: thread.id,
         turnId: turn.id,
         purpose: turnPurpose,
-        prompt,
+        prompt: effectivePrompt,
         cwd: stringOr(params.cwd, thread.cwd),
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
@@ -3326,23 +3389,39 @@ export class CodexClaudeAppServer {
   }
 
   private threadEnvelope(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const sandbox = sandboxEnvelope(thread.sandboxMode, thread.cwd)
+    const profileId =
+      thread.sandboxMode === 'danger-full-access'
+        ? ':danger-full-access'
+        : thread.sandboxMode === 'read-only'
+          ? ':read-only'
+          : ':workspace'
+
     return {
       thread: this.toThread(thread, turns),
       model: thread.model,
       modelProvider: thread.modelProvider,
       serviceTier: null,
       cwd: thread.cwd,
+      runtimeWorkspaceRoots: [thread.cwd],
       instructionSources: [],
-      approvalPolicy: thread.approvalPolicy ?? 'on-request',
+      approvalPolicy: thread.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
-      sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
-      permissionProfile: null,
-      activePermissionProfile: null,
+      sandbox,
+      activePermissionProfile: profileId,
       reasoningEffort: thread.reasoningEffort,
+      multiAgentMode: 'explicitRequestOnly',
     }
   }
 
   private toThread(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const profileId =
+      thread.sandboxMode === 'danger-full-access'
+        ? ':danger-full-access'
+        : thread.sandboxMode === 'read-only'
+          ? ':read-only'
+          : ':workspace'
+
     return {
       id: thread.id,
       sessionId: thread.sessionId,
@@ -3356,6 +3435,8 @@ export class CodexClaudeAppServer {
       path: null,
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
+      canAcceptDirectInput: true,
+      activePermissionProfile: profileId,
       // Defense-in-depth: even if older rows hold an invalid `source` or
       // `threadSource` (legacy `app_server`, empty string from a buggy write
       // path), coerce on the way out so the App's strict deserializer never

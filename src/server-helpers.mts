@@ -123,6 +123,8 @@ export function normalizeSelectableModelId(value: string, fallback: string): str
   const options = claudeModelOptions()
   const ids = new Set(options.map((option) => option.id))
   if (ids.has(value)) return value
+  const matched = options.find((opt) => opt.id.toLowerCase() === value.toLowerCase())
+  if (matched) return matched.id
   if (ids.has(fallback)) return fallback
   const defaultModel = defaultSelectableModelId()
   debugLog('config.model.repaired', { requestedModel: value, repairedModel: defaultModel })

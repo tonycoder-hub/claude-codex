@@ -12,7 +12,7 @@
 // app or `codex login`). We don't manage tokens for it — just forward what
 // the OS user has.
 
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 import { debugLog, resolveCodexBinary } from './util.mjs'
@@ -20,7 +20,7 @@ import { debugLog, resolveCodexBinary } from './util.mjs'
 interface PendingTurn {
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
-  proc: ChildProcessWithoutNullStreams
+  proc: ChildProcess
   rl: Interface
   resolved: boolean
   resolve: () => void
@@ -101,7 +101,7 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       })
 
       const proc = spawn(binary, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
       })
 
