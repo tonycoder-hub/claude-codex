@@ -441,8 +441,14 @@ function parseJsonObject(raw: string | undefined): Record<string, unknown> {
   }
 }
 
-function isNativeClaudeModel(_model: string): boolean {
-  return true
+/**
+ * Determine if a model identifier should be routed to Claude Code runtime.
+ * In modern proxy/gateway environments (such as custom LLM endpoints, local fine-tunes,
+ * or non-Anthropic backend relays), arbitrary model identifiers (e.g. glm-*, ark-*, qwen-*)
+ * can be served via Claude Code CLI. We allow any non-Codex-OpenAI model string to pass through.
+ */
+function isNativeClaudeModel(model: string): boolean {
+  return !isCodexOpenAiModel(model)
 }
 
 export function isCodexOpenAiModel(model: string): boolean {

@@ -3375,11 +3375,40 @@ export class CodexClaudeAppServer {
         action: { type: 'search', query: q || null, queries: null },
       }
     }
+    let displayTool = event.toolName
+    if (event.toolName === 'Read') {
+      const raw = String(event.input.file_path || event.input.path || '')
+      if (raw) {
+        let displayPath = raw
+        try {
+          if (cwd && raw.startsWith(cwd)) {
+            displayPath = raw.slice(cwd.length).replace(/^\/+/, '')
+          } else {
+            const parts = raw.split(/\//).filter(Boolean)
+            displayPath = parts.length > 2 ? parts.slice(-2).join('/') : raw
+          }
+        } catch {}
+        displayTool = `Read ${displayPath || raw}`
+      }
+    } else if (event.toolName === 'Grep') {
+      const pat = String(event.input.pattern ?? '')
+      const rawPath = event.input.path ? String(event.input.path) : ''
+      let pathStr = ''
+      if (rawPath) {
+        const parts = rawPath.split(/\//).filter(Boolean)
+        pathStr = ` (${parts.length > 2 ? parts.slice(-2).join('/') : rawPath})`
+      }
+      if (pat) displayTool = `Grep ${pat}${pathStr}`
+    } else if (event.toolName === 'Glob') {
+      const pat = String(event.input.pattern ?? '')
+      if (pat) displayTool = `Glob ${pat}`
+    }
+
     return {
       type: 'mcpToolCall',
       id,
       server: 'claude-code',
-      tool: event.toolName,
+      tool: displayTool,
       status: 'inProgress',
       arguments: event.input,
       result: null,

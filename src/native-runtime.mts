@@ -688,12 +688,28 @@ export function sdkResumeSessionId(value: string | null, cwd?: string): string |
       if (real !== cwd) slugs.push(slug(real))
     } catch {}
 
-    const configRoots = [join(home, ".claude")]
-    const routerRoot = join(home, ".cache", "paseo", "claude-router")
-    if (existsSync(routerRoot)) {
+    // Discover all candidate config directories (default ~/.claude plus any custom router / multi-model roots)
+    const configRoots = new Set<string>([join(home, ".claude")])
+    if (process.env.CLAUDE_CONFIG_DIR) configRoots.add(process.env.CLAUDE_CONFIG_DIR)
+    const extraRoots = (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || "")
+      .split(/[,:]/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+    for (const extra of extraRoots) {
+      if (existsSync(extra)) configRoots.add(extra)
+    }
+
+    // Generic discovery of cached multi-model router config workspaces under ~/.cache/*/claude-router
+    const cacheBase = join(home, ".cache")
+    if (existsSync(cacheBase)) {
       try {
-        for (const sub of readdirSync(routerRoot)) {
-          configRoots.push(join(routerRoot, sub))
+        for (const sub of readdirSync(cacheBase)) {
+          const routerDir = join(cacheBase, sub, "claude-router")
+          if (existsSync(routerDir)) {
+            for (const item of readdirSync(routerDir)) {
+              configRoots.add(join(routerDir, item))
+            }
+          }
         }
       } catch {}
     }
@@ -717,6 +733,8 @@ export function sdkResumeSessionId(value: string | null, cwd?: string): string |
 
     if (!sourceFile) return null
 
+    // Ensure the session transcript is mirrored across candidate project roots
+    // so switching models or routers retains 100% conversation history
     for (const root of configRoots) {
       for (const s of slugs) {
         const targetDir = join(root, "projects", s)
