@@ -112,15 +112,25 @@ export function configLayerMetadata(): unknown {
   }
 }
 
+export function allSelectableModelOptions(): Array<{
+  id: string
+  sdkModel: string | null
+  displayName: string
+  description: string
+  isDefault?: boolean
+}> {
+  return [...claudeModelOptions(), ...codexProxyModelOptions()]
+}
+
 export function defaultSelectableModelId(): string {
-  const options = claudeModelOptions()
+  const options = allSelectableModelOptions()
   const defaultModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL
   if (defaultModel && options.some((option) => option.id === defaultModel)) return defaultModel
   return options.find((option) => option.isDefault === true)?.id ?? options[0]?.id ?? 'sonnet'
 }
 
 export function normalizeSelectableModelId(value: string, fallback: string): string {
-  const options = claudeModelOptions()
+  const options = allSelectableModelOptions()
   const ids = new Set(options.map((option) => option.id))
   if (ids.has(value)) return value
   const matched = options.find((opt) => opt.id.toLowerCase() === value.toLowerCase())

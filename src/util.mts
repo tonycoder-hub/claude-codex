@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { ImageInput } from './types.mjs'
@@ -275,6 +275,58 @@ export function modelDisplayName(model: string): string {
   return model
 }
 
+function scanDiscoveredRouterModels(): Set<string> {
+  const models = new Set<string>()
+  models.add('sonnet')
+  models.add('opus')
+  models.add('haiku')
+  models.add('sonnet-1m')
+  models.add('opus-plan')
+
+  const cacheBase = join(homedir(), '.cache')
+  if (existsSync(cacheBase)) {
+    try {
+      for (const sub of readdirSync(cacheBase)) {
+        const routerDir = join(cacheBase, sub, 'claude-router')
+        if (existsSync(routerDir)) {
+          for (const item of readdirSync(routerDir)) {
+            if (!item.startsWith('.')) models.add(item)
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const extraRoots = (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
+    .split(/[,:]/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  for (const extra of extraRoots) {
+    if (existsSync(extra)) {
+      try {
+        for (const item of readdirSync(extra)) {
+          if (!item.startsWith('.')) models.add(item)
+        }
+      } catch {}
+    }
+  }
+  return models
+}
+
+let cachedDiscoveredModels: { expiresAt: number; set: Set<string> } | null = null
+function getDiscoveredRouterModelsCached(): Set<string> {
+  const now = Date.now()
+  if (cachedDiscoveredModels && cachedDiscoveredModels.expiresAt > now) {
+    return cachedDiscoveredModels.set
+  }
+  const set = scanDiscoveredRouterModels()
+  cachedDiscoveredModels = { expiresAt: now + 15_000, set }
+  return set
+}
+
+let cachedClaudeModelOptions: { expiresAt: number; data: Array<any> } | null = null
+let cachedCodexProxyModelOptions: { expiresAt: number; data: Array<any> } | null = null
+
 export function claudeModelOptions(): Array<{
   id: string
   sdkModel: string | null
@@ -314,16 +366,49 @@ export function claudeModelOptions(): Array<{
       .map((part) => modelOption(part.trim()))
       .filter((entry) => entry.id.length > 0)
   }
-  return [
-    modelOption('sonnet', true, 'Claude Code latest Sonnet alias'),
-    modelOption('opus', false, 'Claude Code latest Opus alias'),
-    modelOption('haiku', false, 'Claude Code latest Haiku alias'),
-    modelOption('sonnet-1m', false, 'Claude Code Sonnet long-context alias'),
-    modelOption('opus-plan', false, 'Claude Code Opus planning alias'),
-    modelOption('claude-sonnet-4-6', false, 'Pinned Claude Sonnet model'),
-    modelOption('claude-sonnet-4-5', false, 'Pinned Claude Sonnet model'),
-    modelOption('claude-opus-4-5', false, 'Pinned Claude Opus model'),
-  ]
+  const now = Date.now()
+  if (cachedClaudeModelOptions && cachedClaudeModelOptions.expiresAt > now) {
+    return cachedClaudeModelOptions.data
+  }
+
+  const models = new Set<string>()
+  models.add('sonnet')
+  models.add('opus')
+  models.add('haiku')
+  models.add('sonnet-1m')
+  models.add('opus-plan')
+
+  const cacheBase = join(homedir(), '.cache')
+  if (existsSync(cacheBase)) {
+    try {
+      for (const sub of readdirSync(cacheBase)) {
+        const routerDir = join(cacheBase, sub, 'claude-router')
+        if (existsSync(routerDir)) {
+          for (const item of readdirSync(routerDir)) {
+            if (!item.startsWith('.')) models.add(item)
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const extraRoots = (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
+    .split(/[,:]/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  for (const extra of extraRoots) {
+    if (existsSync(extra)) {
+      try {
+        for (const item of readdirSync(extra)) {
+          if (!item.startsWith('.')) models.add(item)
+        }
+      } catch {}
+    }
+  }
+
+  const result = Array.from(models).map((m, i) => modelOption(m, i === 0))
+  cachedClaudeModelOptions = { expiresAt: now + 15_000, data: result }
+  return result
 }
 
 export function resolveClaudeModel(
@@ -358,6 +443,11 @@ export function resolveClaudeModel(
     const list = configured.split(',').map((s) => s.trim()).filter(Boolean)
     const matched = list.find((m) => m.toLowerCase() === raw.toLowerCase())
     if (matched) return matched
+  }
+  // Match case-insensitively against discovered router models
+  const discoveredIds = getDiscoveredRouterModelsCached()
+  for (const id of discoveredIds) {
+    if (id.toLowerCase() === raw.toLowerCase()) return id
   }
   if (isNativeClaudeModel(raw)) return raw
   return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
@@ -474,14 +564,34 @@ export function codexProxyModelOptions(): Array<{
   if (process.env.CLAUDE_CODEX_MOCK === '1') return []
   if (process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1') return []
   if (!resolveCodexBinary()) return []
+  const now = Date.now()
+  if (cachedCodexProxyModelOptions && cachedCodexProxyModelOptions.expiresAt > now) {
+    return cachedCodexProxyModelOptions.data
+  }
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
-  const ids =
-    env && env.trim()
-      ? env
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-codex', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
+  let ids: string[] = []
+  if (env && env.trim()) {
+    ids = env.split(',').map((s) => s.trim()).filter(Boolean)
+  } else {
+    const catalogCandidates = [
+      '/data00/home/zhengyongchuan/.codex/model_catalog.json',
+      join(homedir(), '.codex/model_catalog.json'),
+    ]
+    for (const p of catalogCandidates) {
+      if (existsSync(p)) {
+        try {
+          const cat = JSON.parse(readFileSync(p, 'utf8'))
+          if (cat && Array.isArray(cat.models)) {
+            ids = cat.models.map((m: any) => m.slug || m.id || m.model).filter(Boolean)
+            break
+          }
+        } catch {}
+      }
+    }
+    if (ids.length === 0) {
+      ids = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']
+    }
+  }
   return ids.map((id) => ({
     id,
     sdkModel: id,
@@ -497,18 +607,25 @@ export function codexProxyModelOptions(): Array<{
 export function resolveCodexBinary(): string | null {
   const explicit = process.env.CODEX_REAL
   if (explicit && explicit.trim()) return explicit.trim()
+  const knownCandidates = [
+    '/data00/home/zhengyongchuan/.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
+    join(homedir(), '.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real'),
+  ]
+  for (const c of knownCandidates) {
+    if (existsSync(c)) return c
+  }
   // PATH walk is mostly for dev — production deployments should set
   // CODEX_REAL explicitly in the shim env (~/.zshenv).
   const paths = (process.env.PATH ?? '').split(':').filter(Boolean)
-  const fsSync = require('node:fs') as typeof import('node:fs')
+  
   for (const dir of paths) {
     const candidate = `${dir}/codex`
     try {
-      const st = fsSync.statSync(candidate)
+      const st = statSync(candidate)
       if (!st.isFile()) continue
       // Skip our shim — a hashbang + 'CLAUDE_CODEX' header is a strong
       // signal it's our codex-shim and would recurse.
-      const head = fsSync.readFileSync(candidate, { encoding: 'utf8' }).slice(0, 200)
+      const head = readFileSync(candidate, { encoding: 'utf8' }).slice(0, 200)
       if (head.includes('CLAUDE_CODEX_ADAPTER') || head.includes('claude-codex')) continue
       return candidate
     } catch {}
