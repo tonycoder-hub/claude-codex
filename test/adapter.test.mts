@@ -2665,6 +2665,120 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
   }
 })
 
+test('subagent without a terminal result is closed as failed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'orphan subagent check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+
+    let childThreadId = ''
+    let waitStatus = ''
+    let closeStatus = ''
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/completed') {
+        const item = message.params.item
+        if (item.type === 'collabAgentToolCall' && item.tool === 'spawnAgent')
+          childThreadId = String(item.receiverThreadIds[0] ?? '')
+        if (item.type === 'collabAgentToolCall' && item.tool === 'wait') waitStatus = item.status
+        if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent')
+          closeStatus = item.status
+      }
+      if (message.method === 'turn/completed') break
+    }
+
+    assert.ok(childThreadId)
+    assert.equal(waitStatus, 'failed')
+    assert.equal(closeStatus, 'failed')
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/turns/list', params: { threadId: childThreadId } }),
+    )
+    const childTurns = await reader.nextResponse(3)
+    assert.equal(childTurns.result.data[0].status, 'failed')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('bare /workflows lists prior workflow runs without invoking the model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: '/workflows subagent check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    for (let i = 0; i < 300; i += 1) {
+      if ((await reader.next()).method === 'turn/completed') break
+    }
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: '/workflows', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(3)
+    let listText = ''
+    for (let i = 0; i < 100; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') listText += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+
+    assert.match(listText, /Workflow runs in this task:/)
+    assert.match(listText, /1 agent\(s\)/)
+    assert.match(listText, /subagent check/)
+    assert.doesNotMatch(listText, /Claude Code adapter mock response/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/start picks up effort from config.model_reasoning_effort when top-level effort is absent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -3536,6 +3650,131 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
       assert.deepEqual(status?.params.status, { type: 'idle' })
       const response = messages.find((message) => 'id' in message && message.id === 1)
       assert.deepEqual(response?.result, {})
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('runtime settlement cannot overwrite an interrupted turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const controls = new Map()
+      const controlsByThread = new Map()
+      const outcomes = new Map()
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'active-' + context.turnId,
+            toolName: 'Task',
+            input: { description: 'active subagent', prompt: 'wait for interruption' },
+          })
+          return new Promise((resolve, reject) => {
+            const control = { resolve, reject }
+            controls.set(context.turnId, control)
+            controlsByThread.set(context.threadId, control)
+          })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          const control = controlsByThread.get(threadId)
+          if (outcomes.get(threadId) === 'resolve') control.resolve()
+          else control.reject(new Error('runtime rejected during interrupt'))
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for runtime control')
+      }
+
+      let requestId = 0
+      for (const outcome of ['resolve', 'reject']) {
+        await server.handle(peer, {
+          id: ++requestId,
+          method: 'thread/start',
+          params: { cwd: process.cwd(), persistExtendedHistory: false },
+        })
+        const threadId = response(requestId).result.thread.id
+        await server.handle(peer, {
+          id: ++requestId,
+          method: 'turn/start',
+          params: {
+            threadId,
+            input: [{ type: 'text', text: 'interrupt workflow', text_elements: [] }],
+          },
+        })
+        const turnId = response(requestId).result.turn.id
+        await waitFor(() => controls.has(turnId))
+        outcomes.set(threadId, outcome)
+        await server.handle(peer, {
+          id: ++requestId,
+          method: 'turn/interrupt',
+          params: { threadId, turnId },
+        })
+        await new Promise((resolve) => setTimeout(resolve, 25))
+
+        assert.equal(store.getTurn(turnId)?.status, 'interrupted')
+        const completions = messages.filter(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === turnId,
+        )
+        assert.equal(completions.length, 1)
+        assert.equal(completions[0].params.turn.status, 'interrupted')
+        const closeIndex = messages.findIndex(
+          (message) =>
+            'method' in message &&
+            message.method === 'item/completed' &&
+            message.params.turnId === turnId &&
+            message.params.item.type === 'collabAgentToolCall' &&
+            message.params.item.tool === 'closeAgent',
+        )
+        const terminalIndex = messages.findIndex(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === turnId,
+        )
+        assert.ok(closeIndex >= 0)
+        assert.ok(closeIndex < terminalIndex)
+        assert.equal(
+          messages.some(
+            (message) =>
+              'method' in message &&
+              message.method === 'error' &&
+              message.params.turnId === turnId,
+          ),
+          false,
+        )
+      }
       await server.stop()
     `,
       ],

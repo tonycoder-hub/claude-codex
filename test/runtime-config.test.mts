@@ -13,6 +13,33 @@ import {
 } from '../src/http-agent-runtime.mjs'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
+import type { RuntimeTurnContext } from '../src/types.mjs'
+import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
+
+function nativeTurnContext(overrides: Partial<RuntimeTurnContext> = {}): RuntimeTurnContext {
+  return {
+    threadId: 'thread',
+    turnId: 'turn',
+    prompt: 'hello',
+    cwd: process.cwd(),
+    runtimeType: null,
+    model: null,
+    effort: null,
+    claudeSessionId: null,
+    forkSession: false,
+    mcpServers: null,
+    allowedTools: null,
+    addDirs: [],
+    enableFileCheckpointing: false,
+    outputFormat: null,
+    approvalPolicy: null,
+    sandboxMode: null,
+    systemPromptAddendum: null,
+    planMode: false,
+    imageInputs: [],
+    ...overrides,
+  }
+}
 
 test('runtime config keeps legacy defaults and accepts explicit backends', () => {
   assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
@@ -58,6 +85,114 @@ test('native SDK runtime ignores bridge session markers when resuming SDK turns'
   assert.equal(sdkResumeSessionId('agentapi:http://127.0.0.1:3284'), null)
   assert.equal(sdkResumeSessionId('claude-p:session'), null)
   assert.equal(sdkResumeSessionId('sdk-session'), 'sdk-session')
+})
+
+test('native SDK runtime maps manual /workflows prompts to the human workflow trigger', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const context = nativeTurnContext({ prompt: '/workflows open three subagents, reply ok' })
+  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
+  const messages: any[] = []
+  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+
+  assert.equal(
+    messages[0].message.content,
+    [
+      'ultracode: open three subagents, reply ok',
+      '',
+      'Keep the launched workflow attached to this turn: wait for every workflow task to finish before returning the final response.',
+    ].join('\n'),
+  )
+  assert.deepEqual(messages[0].origin, { kind: 'human' })
+
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const options = buildOptions.call(runtime, {}, context, new AbortController())
+  assert.deepEqual(options.settings, {
+    enableWorkflows: true,
+    workflowKeywordTriggerEnabled: true,
+  })
+  assert.equal(options.permissionMode, 'default')
+  assert.equal(typeof options.canUseTool, 'function')
+})
+
+test('workflow command parser keeps list and run semantics distinct', () => {
+  assert.deepEqual(parseWorkflowCommand('/workflows'), { type: 'list' })
+  assert.deepEqual(parseWorkflowCommand('  /workflows inspect the adapter'), {
+    type: 'run',
+    prompt: 'inspect the adapter',
+  })
+  assert.equal(parseWorkflowCommand('/workflowsx inspect'), null)
+  assert.equal(workflowRuntimePrompt('/workflows'), '/workflows')
+
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const options = buildOptions.call(
+    runtime,
+    {},
+    nativeTurnContext({ prompt: '/workflows' }),
+    new AbortController(),
+  )
+  assert.equal(options.settings, undefined)
+})
+
+test('manual workflow normalization preserves attached image blocks', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
+  const context = nativeTurnContext({
+    prompt: '/workflows inspect this image',
+    imageInputs: [
+      {
+        kind: 'url',
+        mediaType: 'image/png',
+        data: 'https://example.com/image.png',
+        displayPath: 'https://example.com/image.png',
+      },
+    ],
+  })
+  const messages: any[] = []
+  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  assert.match(messages[0].message.content[0].text, /^ultracode: inspect this image/)
+  assert.deepEqual(messages[0].message.content[1], {
+    type: 'image',
+    source: { type: 'url', url: 'https://example.com/image.png' },
+  })
+})
+
+test('native SDK runtime maps local workflow task events to one Agent lifecycle', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = {
+    activeSubagents: new Set<string>(),
+    completedWorkflowTasks: new Set<string>(),
+    handlers: { onEvent: async (event: unknown) => events.push(event) },
+  }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'task_started',
+    task_id: 'wf-123',
+    task_type: 'local_workflow',
+    workflow_name: 'parallel-review',
+    description: 'Review three modules',
+  })
+  await handleSystem.call(runtime, pending, {
+    subtype: 'task_notification',
+    task_id: 'wf-123',
+    status: 'completed',
+    summary: 'All reviewers completed',
+    usage: { total_tokens: 100, tool_uses: 3, duration_ms: 2500 },
+  })
+  await handleSystem.call(runtime, pending, {
+    subtype: 'task_started',
+    task_id: 'wf-123',
+    task_type: 'local_workflow',
+  })
+
+  assert.equal(events.length, 2)
+  assert.equal(events[0].toolName, 'Agent')
+  assert.equal(events[0].input.subagent_type, 'workflow')
+  assert.equal(events[1].toolUseId, 'workflow-task:wf-123')
+  assert.match(events[1].content, /total_tokens: 100/)
+  assert.equal(events[1].isError, false)
 })
 
 test('native SDK permission allow result carries original input for SDK validation', async () => {

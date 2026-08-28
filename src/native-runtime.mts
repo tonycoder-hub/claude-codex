@@ -34,6 +34,7 @@ import type {
   UserInputQuestion,
 } from './types.mjs'
 import { newId } from './util.mjs'
+import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 
 type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
 
@@ -52,6 +53,7 @@ interface PendingTurn {
   // nested tool_use / text / thinking events should be hidden from the App
   // timeline until the matching tool_result closes the parent Task.
   activeSubagents: Set<string>
+  completedWorkflowTasks: Set<string>
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -102,6 +104,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         streamedText: false,
         streamedThinking: false,
         activeSubagents: new Set(),
+        completedWorkflowTasks: new Set(),
         toolStartSeen: new Set(),
         structuredBuffer: '',
         pendingUserMessage: null,
@@ -132,8 +135,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           (async function* () {
             yield {
               type: 'user',
-              message: { role: 'user', content: prompt },
+              message: { role: 'user', content: workflowRuntimePrompt(prompt) },
               parent_tool_use_id: null,
+              origin: { kind: 'human' },
             }
           })(),
         )
@@ -170,7 +174,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   private buildPromptIterable(context: RuntimeTurnContext): AsyncIterable<any> {
-    const text = context.prompt
+    const text = workflowRuntimePrompt(context.prompt)
     const images = context.imageInputs
     return (async function* () {
       if (!images || images.length === 0) {
@@ -180,6 +184,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           type: 'user' as const,
           message: { role: 'user' as const, content: text },
           parent_tool_use_id: null,
+          origin: { kind: 'human' as const },
         }
         return
       }
@@ -203,6 +208,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         type: 'user' as const,
         message: { role: 'user' as const, content },
         parent_tool_use_id: null,
+        origin: { kind: 'human' as const },
       }
     })()
   }
@@ -237,6 +243,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // acceptEdits (no prompt for write/edit until something fails).
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
+
+    if (parseWorkflowCommand(context.prompt)?.type === 'run') {
+      opts.settings = {
+        ...((opts.settings as Record<string, unknown> | undefined) ?? {}),
+        enableWorkflows: true,
+        workflowKeywordTriggerEnabled: true,
+      }
+    }
 
     // Per-tool approval round-trip with Codex App. We attach canUseTool in
     // every non-plan mode so we can also intercept AskUserQuestion (which
@@ -425,6 +439,48 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         type: 'notice',
         level: 'warning',
         message: `Permission denied for ${toolName}`,
+      })
+      return
+    }
+    if (subtype === 'task_started' && isWorkflowBackgroundTask(message)) {
+      const taskId = String(message.task_id ?? '')
+      if (!taskId || message.skip_transcript === true) return
+      const toolUseId = workflowTaskToolUseId(taskId)
+      if (pending.activeSubagents.has(toolUseId) || pending.completedWorkflowTasks.has(toolUseId))
+        return
+      pending.activeSubagents.add(toolUseId)
+      const workflowName = String(message.workflow_name ?? '').trim()
+      const description = String(message.description ?? '').trim()
+      const prompt = String(message.prompt ?? '').trim() || description || workflowName
+      await pending.handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: {
+          description: workflowName ? `Workflow: ${workflowName}` : 'Workflow',
+          prompt,
+          subagent_type: 'workflow',
+        },
+      })
+      return
+    }
+    if (subtype === 'task_notification') {
+      const taskId = String(message.task_id ?? '')
+      if (!taskId) return
+      const toolUseId = workflowTaskToolUseId(taskId)
+      if (!pending.activeSubagents.delete(toolUseId)) return
+      pending.completedWorkflowTasks.add(toolUseId)
+      const status = String(message.status ?? '')
+      const summary = String(message.summary ?? '').trim() || `Workflow ${status || 'finished'}`
+      const usage = workflowTaskUsage(message.usage)
+      const trailer = usage
+        ? `\n<usage>total_tokens: ${usage.totalTokens}\ntool_uses: ${usage.toolUses}\nduration_ms: ${usage.durationMs}</usage>`
+        : ''
+      await pending.handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `${summary}${trailer}`,
+        isError: status !== 'completed',
       })
     }
   }
@@ -652,6 +708,29 @@ function isSubagentTool(name: string): boolean {
   return (
     n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
   )
+}
+
+function isWorkflowBackgroundTask(message: Record<string, unknown>): boolean {
+  const taskType = String(message.task_type ?? '')
+  return taskType === 'local_workflow' || taskType === 'workflow'
+}
+
+function workflowTaskToolUseId(taskId: string): string {
+  return `workflow-task:${taskId}`
+}
+
+function workflowTaskUsage(value: unknown): {
+  totalTokens: number
+  toolUses: number
+  durationMs: number
+} | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const usage = value as Record<string, unknown>
+  const totalTokens = numberOrNull(usage.total_tokens)
+  const toolUses = numberOrNull(usage.tool_uses)
+  const durationMs = numberOrNull(usage.duration_ms)
+  if (totalTokens === null || toolUses === null || durationMs === null) return null
+  return { totalTokens, toolUses, durationMs }
 }
 
 function numberOrNull(value: unknown): number | null {

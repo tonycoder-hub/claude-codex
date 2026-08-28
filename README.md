@@ -56,6 +56,16 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
+### `/workflows` compatibility
+
+With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
+`ultracode:` workflow trigger. Workflow task events are exposed as Codex-native reviewable
+Subagent threads. A bare `/workflows` lists workflow runs recorded in the current Codex thread.
+
+This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
+agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
+management actions such as pause, resume, stop, and save are not implemented.
+
 ## Current release boundaries
 
 - **Production path:** the TypeScript app-server adapter remains the shipping

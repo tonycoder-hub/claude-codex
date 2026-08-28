@@ -248,6 +248,18 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/orphan subagent check/i.test(context.prompt)) {
+      const taskId = `task-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: taskId,
+        toolName: 'Task',
+        input: { description: 'orphaned mock subagent', prompt: 'investigate disconnect' },
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'missing tool result' })
+      return
+    }
+
     if (/subagent check/i.test(context.prompt)) {
       // Drive the subagent suppression contract: a Task tool_use opens the
       // subagent context, internal tool_use/text/tool_result are emitted but

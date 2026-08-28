@@ -114,11 +114,27 @@ import {
   resolveClaudeModel,
   textFromInput,
 } from './util.mjs'
+import { parseWorkflowCommand } from './workflow-command.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 
 type TurnItemsView = 'full' | 'summary' | 'notLoaded'
+
+interface SubagentContext {
+  childThreadId: string
+  waitItemId: string
+  prompt: string
+  subType: string | null
+}
+
+interface ActiveSubagentState {
+  peer: RpcPeer
+  thread: ThreadRecord
+  turn: TurnRecord
+  contexts: Map<string, SubagentContext>
+  active: Set<string>
+}
 
 function turnItemsView(value: unknown): TurnItemsView {
   if (value === 'full' || value === 'summary' || value === 'notLoaded') return value
@@ -132,6 +148,7 @@ export class CodexClaudeAppServer {
   >()
   private activePeerByThread = new Map<string, RpcPeer>()
   private activeTurnByThread = new Map<string, string>()
+  private subagentStateByTurn = new Map<string, ActiveSubagentState>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
   private commandSessionAllow = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
@@ -1282,6 +1299,7 @@ export class CodexClaudeAppServer {
     // inline next to the user message instead of losing them.
     const { textPrompt, images } = extractImageInputs(input)
     const prompt = textPrompt || textFromInput(input)
+    const workflowCommand = parseWorkflowCommand(prompt)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, thread.model)
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
@@ -1352,12 +1370,18 @@ export class CodexClaudeAppServer {
           params: { threadId, turnId, item, completedAtMs: nowMillis() },
         })
       }
+      if (params.outputSchema == null && workflowCommand?.type === 'list') {
+        this.completeWorkflowListTurn(peer, thread, turn)
+        return
+      }
       // Carry parsed images through the params bag so runRuntimeTurn can hand
       // them to the runtime context without re-parsing user input.
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         ...params,
         _imageInputs: images,
       }).catch((error) => {
+        const current = this.store.getTurn(turnId)
+        if (current && current.status !== 'inProgress') return
         const completed =
           this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
         this.notify(peer, {
@@ -1373,6 +1397,109 @@ export class CodexClaudeAppServer {
       })
     })
     return { turn: publicTurn }
+  }
+
+  private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
+    const itemId = newId()
+    const emptyItem: ThreadItem = {
+      type: 'agentMessage',
+      id: itemId,
+      text: '',
+      phase: null,
+      memoryCitation: null,
+    }
+    this.store.appendItem(turn.id, emptyItem)
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId: thread.id, turnId: turn.id, item: emptyItem, startedAtMs: nowMillis() },
+    })
+
+    const text = this.workflowListText(thread.id, turn.id)
+    const completedItem: ThreadItem = { ...emptyItem, text }
+    this.store.updateItem(turn.id, itemId, () => completedItem)
+    this.notify(peer, {
+      method: 'item/agentMessage/delta',
+      params: { threadId: thread.id, turnId: turn.id, itemId, delta: text },
+    })
+    this.notify(peer, {
+      method: 'item/completed',
+      params: {
+        threadId: thread.id,
+        turnId: turn.id,
+        item: completedItem,
+        completedAtMs: nowMillis(),
+      },
+    })
+
+    const completed = this.store.completeTurn(turn.id, 'completed') ?? turn
+    recordRunEvent('turn.completed', {
+      threadId: thread.id,
+      turnId: turn.id,
+      runtimeBackend: thread.runtimeBackend,
+      durationMs: completed.durationMs,
+      command: 'workflows.list',
+    })
+    this.clearActiveTurn(thread.id)
+    this.setThreadStatus(peer, thread.id, { type: 'idle' })
+    this.notify(peer, {
+      method: 'turn/completed',
+      params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
+    })
+  }
+
+  private workflowListText(threadId: string, currentTurnId: string): string {
+    const runs = this.store
+      .listTurns(threadId)
+      .filter((turn) => turn.id !== currentTurnId)
+      .map((turn) => {
+        const userItem = turn.items.find((item) => item.type === 'userMessage')
+        const prompt = userItem?.type === 'userMessage' ? textFromInput(userItem.content) : ''
+        const command = parseWorkflowCommand(prompt)
+        if (command?.type !== 'run') return null
+        const childIds = new Set<string>()
+        for (const item of turn.items) {
+          if (item.type !== 'collabAgentToolCall' || item.tool !== 'spawnAgent') continue
+          for (const childId of item.receiverThreadIds) childIds.add(childId)
+        }
+        const agents = Array.from(childIds).map((childId) => {
+          const child = this.store.getThread(childId)
+          const latestTurn = this.store.listTurns(childId).at(-1)
+          return {
+            nickname: child?.agentNickname ?? childId.slice(0, 12),
+            role: child?.agentRole ?? 'subagent',
+            status: latestTurn?.status ?? child?.status.type ?? 'unknown',
+          }
+        })
+        return { turn, prompt: command.prompt, agents }
+      })
+      .filter((run): run is NonNullable<typeof run> => run !== null)
+      .reverse()
+      .slice(0, 20)
+
+    if (runs.length === 0) {
+      return [
+        'No workflow runs in this task.',
+        '',
+        'Start one with `/workflows <task>`. The adapter runs it through Claude ultracode and exposes its agents as reviewable Codex subagent tasks.',
+      ].join('\n')
+    }
+
+    const lines = ['Workflow runs in this task:']
+    for (const run of runs) {
+      const task = run.prompt.replace(/\s+/g, ' ').slice(0, 120)
+      lines.push(
+        `- ${run.turn.id.slice(0, 12)} · ${run.turn.status} · ${run.agents.length} agent(s) · ${task}`,
+      )
+      if (run.agents.length > 0) {
+        lines.push(
+          `  Agents: ${run.agents
+            .map((agent) => `${agent.nickname} (${agent.role}, ${agent.status})`)
+            .join(', ')}`,
+        )
+      }
+    }
+    lines.push('', 'Open the Agent items in the workflow turn to review each child task.')
+    return lines.join('\n')
   }
 
   private async runRuntimeTurn(
@@ -1394,10 +1521,7 @@ export class CodexClaudeAppServer {
     // Together they tell Codex App which child thread to navigate into and
     // give the user a live "agent is running" indicator instead of a single
     // collapsed item that goes silent for the duration of the subagent.
-    const subagentContexts = new Map<
-      string,
-      { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }
-    >()
+    const subagentContexts = new Map<string, SubagentContext>()
     const activeSubagents = new Set<string>()
     // Track per-item start time so commandExecution / mcpToolCall items can
     // report a real durationMs in turn/completed (otherwise the App's status
@@ -1539,7 +1663,14 @@ export class CodexClaudeAppServer {
     // mock runtime handles everything regardless of model id — bypass the
     // codex-proxy override so unit tests stay deterministic.
     const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
-    await this.runtime.runTurn(
+    this.subagentStateByTurn.set(turn.id, {
+      peer,
+      thread,
+      turn,
+      contexts: subagentContexts,
+      active: activeSubagents,
+    })
+    const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
         turnId: turn.id,
@@ -2280,6 +2411,23 @@ export class CodexClaudeAppServer {
         },
       },
     )
+    await runtimeTurn.then(
+      () => {
+        if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+          this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
+        }
+        this.subagentStateByTurn.delete(turn.id)
+      },
+      (error: unknown) => {
+        if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+          this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
+        }
+        this.subagentStateByTurn.delete(turn.id)
+        throw error
+      },
+    )
+    const currentTurn = this.store.getTurn(turn.id)
+    if (currentTurn && currentTurn.status !== 'inProgress') return
 
     const finalDiff = await gitDiff(thread.cwd)
     if (finalDiff) {
@@ -2335,6 +2483,125 @@ export class CodexClaudeAppServer {
       method: 'turn/completed',
       params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
     })
+  }
+
+  private finalizeOrphanedSubagents(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    contexts: Map<string, SubagentContext>,
+    active: Set<string>,
+  ): void {
+    for (const toolUseId of Array.from(active)) {
+      const context = contexts.get(toolUseId)
+      active.delete(toolUseId)
+      contexts.delete(toolUseId)
+      if (!context) continue
+
+      const message = 'Subagent ended without a terminal task result.'
+      const now = nowSeconds()
+      const childTurn: TurnRecord = {
+        id: newId(),
+        threadId: context.childThreadId,
+        status: 'failed',
+        startedAt: now,
+        completedAt: now,
+        durationMs: 0,
+        items: [
+          {
+            type: 'userMessage',
+            id: newId(),
+            content: [{ type: 'text', text: context.prompt, text_elements: [] }],
+          },
+          {
+            type: 'agentMessage',
+            id: newId(),
+            text: message,
+            phase: null,
+            memoryCitation: null,
+          },
+        ],
+        diff: '',
+        error: { message },
+      }
+      this.store.upsertTurn(childTurn)
+      const childThread = this.store.getThread(context.childThreadId)
+      if (childThread) {
+        childThread.status = { type: 'idle' }
+        childThread.updatedAt = now
+        this.store.upsertThread(childThread)
+      }
+      recordRunEvent('subagent.completed', {
+        parentThreadId: thread.id,
+        parentTurnId: turn.id,
+        childThreadId: context.childThreadId,
+        childTurnId: childTurn.id,
+        status: 'failed',
+        agentRole: context.subType ?? 'general-purpose',
+      })
+
+      const waitEnd: ThreadItem = {
+        type: 'collabAgentToolCall',
+        id: context.waitItemId,
+        tool: 'wait',
+        status: 'failed',
+        senderThreadId: thread.id,
+        receiverThreadIds: [context.childThreadId],
+        prompt: null,
+        model: null,
+        reasoningEffort: null,
+        agentsStates: { [context.childThreadId]: { status: 'errored', message } },
+      }
+      this.store.updateItem(turn.id, context.waitItemId, () => waitEnd)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          item: waitEnd,
+          completedAtMs: nowMillis(),
+        },
+      })
+
+      const closeId = newId()
+      const closeBegin: ThreadItem = {
+        type: 'collabAgentToolCall',
+        id: closeId,
+        tool: 'closeAgent',
+        status: 'inProgress',
+        senderThreadId: thread.id,
+        receiverThreadIds: [context.childThreadId],
+        prompt: null,
+        model: null,
+        reasoningEffort: null,
+        agentsStates: {},
+      }
+      this.store.appendItem(turn.id, closeBegin)
+      this.notify(peer, {
+        method: 'item/started',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          item: closeBegin,
+          startedAtMs: nowMillis(),
+        },
+      })
+      const closeEnd: ThreadItem = {
+        ...closeBegin,
+        status: 'failed',
+        agentsStates: { [context.childThreadId]: { status: 'errored', message } },
+      }
+      this.store.updateItem(turn.id, closeId, () => closeEnd)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          item: closeEnd,
+          completedAtMs: nowMillis(),
+        },
+      })
+    }
   }
 
   private async requestApproval(
@@ -2438,11 +2705,22 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
     const activeTurnId = this.activeTurnByThread.get(threadId)
-    await this.runtime.interrupt(threadId)
+    const interrupting = this.runtime.interrupt(threadId)
     const turnId = activeTurnId || requestedTurnId
     if (turnId) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
+        const subagents = this.subagentStateByTurn.get(turnId)
+        if (subagents) {
+          this.finalizeOrphanedSubagents(
+            subagents.peer,
+            subagents.thread,
+            subagents.turn,
+            subagents.contexts,
+            subagents.active,
+          )
+          this.subagentStateByTurn.delete(turnId)
+        }
         const completed =
           this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
         this.notify(peer, {
@@ -2453,6 +2731,7 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(threadId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
+    await interrupting
     return {}
   }
 
