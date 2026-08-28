@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -3704,7 +3704,13 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
         async stop() {},
       })
       const messages = []
-      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const peer = {
+        id: 'peer',
+        send(message) {
+          messages.push({ ...message, deliveredTo: 'peer' })
+        },
+        close() {},
+      }
       const response = (id) => messages.find((message) => 'id' in message && message.id === id)
       const waitFor = async (condition) => {
         for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -3733,7 +3739,20 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
         const turnId = response(requestId).result.turn.id
         await waitFor(() => controls.has(turnId))
         outcomes.set(threadId, outcome)
-        await server.handle(peer, {
+        const interruptPeer = {
+          id: 'peer-reconnected',
+          send(message) {
+            messages.push({ ...message, deliveredTo: 'peer-reconnected' })
+          },
+          close() {},
+        }
+        server.closePeer(peer)
+        await server.handle(interruptPeer, {
+          id: ++requestId,
+          method: 'thread/resume',
+          params: { threadId },
+        })
+        await server.handle(interruptPeer, {
           id: ++requestId,
           method: 'turn/interrupt',
           params: { threadId, turnId },
@@ -3765,6 +3784,22 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
         )
         assert.ok(closeIndex >= 0)
         assert.ok(closeIndex < terminalIndex)
+        assert.equal(messages[closeIndex].deliveredTo, 'peer-reconnected')
+        assert.equal(messages[terminalIndex].deliveredTo, 'peer-reconnected')
+        assert.equal(
+          messages
+            .filter(
+              (message) =>
+                'method' in message &&
+                message.method === 'item/completed' &&
+                message.params.turnId === turnId &&
+                message.params.item.type === 'collabAgentToolCall' &&
+                (message.params.item.tool === 'wait' ||
+                  message.params.item.tool === 'closeAgent'),
+            )
+            .every((message) => message.deliveredTo === 'peer-reconnected'),
+          true,
+        )
         assert.equal(
           messages.some(
             (message) =>
@@ -3779,6 +3814,142 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
     `,
       ],
       { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const repo = join(home, 'repo')
+  const bin = join(home, 'bin')
+  const diffStarted = join(home, 'git-diff-started')
+  const diffRelease = join(home, 'git-diff-release')
+  await mkdir(repo, { recursive: true })
+  await mkdir(bin, { recursive: true })
+  execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+  const fakeGit = join(bin, 'git')
+  await writeFile(
+    fakeGit,
+    [
+      '#!/bin/sh',
+      'if [ "$1" = "rev-parse" ] && [ "$2" = "--is-inside-work-tree" ]; then',
+      "  printf 'true\\n'",
+      '  exit 0',
+      'fi',
+      'if [ "$1" = "diff" ]; then',
+      '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
+      '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
+      "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",
+      '  exit 0',
+      'fi',
+      'exec "$CLAUDE_CODEX_REAL_GIT" "$@"',
+      '',
+    ].join('\n'),
+  )
+  await chmod(fakeGit, 0o755)
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { existsSync, writeFileSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn() {},
+        async steer() {},
+        async interrupt() {},
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for final git diff')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: ${JSON.stringify(repo)}, persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'interrupt during final diff', text_elements: [] }],
+        },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_STARTED))
+
+      await server.handle(peer, {
+        id: 3,
+        method: 'turn/interrupt',
+        params: { threadId, turnId },
+      })
+      writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      assert.equal(store.getTurn(turnId)?.status, 'interrupted')
+      const completions = messages.filter(
+        (message) =>
+          'method' in message &&
+          message.method === 'turn/completed' &&
+          message.params.turn.id === turnId,
+      )
+      assert.equal(completions.length, 1)
+      assert.equal(completions[0].params.turn.status, 'interrupted')
+      assert.equal(
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/diff/updated' &&
+            message.params.turnId === turnId,
+        ),
+        false,
+      )
+      assert.equal(
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'error' &&
+            message.params.turnId === turnId,
+        ),
+        false,
+      )
+      await server.stop()
+    `,
+      ],
+      {
+        cwd: resolve('.'),
+        stdio: 'pipe',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          CLAUDE_CODEX_REAL_GIT: realGit,
+          CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: diffStarted,
+          CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: diffRelease,
+        },
+      },
     )
   } finally {
     await rm(home, { recursive: true, force: true })

@@ -129,7 +129,6 @@ interface SubagentContext {
 }
 
 interface ActiveSubagentState {
-  peer: RpcPeer
   thread: ThreadRecord
   turn: TurnRecord
   contexts: Map<string, SubagentContext>
@@ -1664,7 +1663,6 @@ export class CodexClaudeAppServer {
     // codex-proxy override so unit tests stay deterministic.
     const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     this.subagentStateByTurn.set(turn.id, {
-      peer,
       thread,
       turn,
       contexts: subagentContexts,
@@ -2217,6 +2215,7 @@ export class CodexClaudeAppServer {
                 params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
               })
             const diff = await gitDiff(thread.cwd)
+            if (this.store.getTurn(turn.id)?.status !== 'inProgress') return
             if (diff) {
               this.store.updateTurnDiff(turn.id, diff)
               this.notify(peer, {
@@ -2430,6 +2429,7 @@ export class CodexClaudeAppServer {
     if (currentTurn && currentTurn.status !== 'inProgress') return
 
     const finalDiff = await gitDiff(thread.cwd)
+    if (this.store.getTurn(turn.id)?.status !== 'inProgress') return
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
       this.notify(peer, {
@@ -2704,6 +2704,7 @@ export class CodexClaudeAppServer {
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
+    this.activePeerByThread.set(threadId, peer)
     const activeTurnId = this.activeTurnByThread.get(threadId)
     const interrupting = this.runtime.interrupt(threadId)
     const turnId = activeTurnId || requestedTurnId
@@ -2713,7 +2714,7 @@ export class CodexClaudeAppServer {
         const subagents = this.subagentStateByTurn.get(turnId)
         if (subagents) {
           this.finalizeOrphanedSubagents(
-            subagents.peer,
+            peer,
             subagents.thread,
             subagents.turn,
             subagents.contexts,

@@ -237,12 +237,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
-    // mode supersedes everything (Codex sends planMode:true via turn/start);
-    // approvalPolicy 'never' / sandbox 'danger-full-access' both mean "skip
-    // per-tool prompts" → bypassPermissions; 'on-failure' approximates
-    // acceptEdits (no prompt for write/edit until something fails).
+    // mode supersedes everything. Relay rejects the SDK's dangerous bypass
+    // flag outside a recognized container sandbox, so App-level Full Access
+    // stays in default mode and auto-allows through canUseTool below. An
+    // explicit env override can still opt into bypassPermissions.
+    const permissionModeOverride = configuredPermissionMode()
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
+    if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
 
     if (parseWorkflowCommand(context.prompt)?.type === 'run') {
       opts.settings = {
@@ -252,14 +254,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
     }
 
-    // Per-tool approval round-trip with Codex App. We attach canUseTool in
-    // every non-plan mode so we can also intercept AskUserQuestion (which
-    // needs to be bridged to the App's native request_user_input even when
-    // the user has chosen Full Access / bypassPermissions). In bypass modes
-    // the callback short-circuits non-AskUserQuestion tools to auto-allow,
-    // preserving the no-prompt behaviour.
-    if (mode !== 'plan') {
-      const autoAllow = mode === 'bypassPermissions' || mode === 'dontAsk'
+    // Per-tool approval round-trip with Codex App. In App-level Full Access,
+    // the bridge auto-allows every permission request without surfacing a UI
+    // prompt. Explicit SDK bypass omits the callback because Claude never calls
+    // it in that mode.
+    if (mode !== 'plan' && mode !== 'bypassPermissions') {
+      const appFullAccess =
+        permissionModeOverride === null &&
+        (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')
+      const autoAllow = appFullAccess || mode === 'dontAsk'
       opts.canUseTool = this.makeCanUseTool(context, autoAllow)
     }
 
@@ -683,22 +686,34 @@ function derivePermissionMode(
   planMode: boolean,
 ): 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto' {
   // Env-level override always wins.
-  const envOverride = process.env.CLAUDE_CODEX_PERMISSION_MODE
-  if (
-    envOverride === 'default' ||
-    envOverride === 'acceptEdits' ||
-    envOverride === 'bypassPermissions' ||
-    envOverride === 'plan' ||
-    envOverride === 'dontAsk' ||
-    envOverride === 'auto'
-  ) {
-    return envOverride
-  }
+  const envOverride = configuredPermissionMode()
+  if (envOverride) return envOverride
   if (planMode) return 'plan'
-  if (sandboxMode === 'danger-full-access') return 'bypassPermissions'
-  if (approvalPolicy === 'never') return 'bypassPermissions'
+  if (sandboxMode === 'danger-full-access' || approvalPolicy === 'never') return 'default'
   if (approvalPolicy === 'on-failure') return 'acceptEdits'
   return 'default'
+}
+
+function configuredPermissionMode():
+  | 'default'
+  | 'acceptEdits'
+  | 'bypassPermissions'
+  | 'plan'
+  | 'dontAsk'
+  | 'auto'
+  | null {
+  const value = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  if (
+    value === 'default' ||
+    value === 'acceptEdits' ||
+    value === 'bypassPermissions' ||
+    value === 'plan' ||
+    value === 'dontAsk' ||
+    value === 'auto'
+  ) {
+    return value
+  }
+  return null
 }
 
 // Subagent tool detection — same allowlist as Python's is_subagent_tool and

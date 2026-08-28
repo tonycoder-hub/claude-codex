@@ -89,7 +89,11 @@ test('native SDK runtime ignores bridge session markers when resuming SDK turns'
 
 test('native SDK runtime maps manual /workflows prompts to the human workflow trigger', async () => {
   const runtime = new NativeClaudeRuntime()
-  const context = nativeTurnContext({ prompt: '/workflows open three subagents, reply ok' })
+  const context = nativeTurnContext({
+    prompt: '/workflows open three subagents, reply ok',
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  })
   const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
   const messages: any[] = []
   for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
@@ -111,7 +115,46 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
     workflowKeywordTriggerEnabled: true,
   })
   assert.equal(options.permissionMode, 'default')
+  assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
+  const turns = Reflect.get(runtime, 'turns') as Map<string, unknown>
+  turns.set(context.turnId, { handlers: {} })
+  try {
+    assert.deepEqual(
+      await options.canUseTool(
+        'Bash',
+        { command: 'true' },
+        {
+          toolUseID: 'tool',
+          signal: new AbortController().signal,
+        },
+      ),
+      { behavior: 'allow' },
+    )
+  } finally {
+    turns.delete(context.turnId)
+  }
+})
+
+test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  process.env.CLAUDE_CODEX_PERMISSION_MODE = 'bypassPermissions'
+  try {
+    const runtime = new NativeClaudeRuntime()
+    const buildOptions = Reflect.get(runtime, 'buildOptions')
+    const options = buildOptions.call(
+      runtime,
+      {},
+      nativeTurnContext({ prompt: '/workflows inspect permissions' }),
+      new AbortController(),
+    )
+    assert.equal(options.permissionMode, 'bypassPermissions')
+    assert.equal(options.allowDangerouslySkipPermissions, true)
+    assert.equal(options.canUseTool, undefined)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
+  }
 })
 
 test('workflow command parser keeps list and run semantics distinct', () => {
