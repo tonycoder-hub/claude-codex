@@ -221,11 +221,15 @@ export class SessionStore {
       const predicates = sourceKinds.flatMap((kind) => {
         switch (kind) {
           case 'subAgent':
+          case 'subAgentThreadSpawn':
+            return ["(t.thread_source = 'subagent' AND t.forked_from_id IS NOT NULL)"]
           case 'subAgentReview':
           case 'subAgentCompact':
-          case 'subAgentThreadSpawn':
           case 'subAgentOther':
-            return ["(t.thread_source = 'subagent' AND t.forked_from_id IS NOT NULL)"]
+            // These source kinds need a persisted discriminator that this
+            // adapter does not have. Fail closed instead of mislabelling a
+            // thread-spawn child as a review/compact/other subagent.
+            return []
           case 'user':
             return ["t.thread_source = 'user'"]
           case 'memoryConsolidation':
@@ -248,13 +252,7 @@ export class SessionStore {
     // session list. Topology queries are the exception: Codex App asks for
     // subagent descendants without sending our legacy includeEphemeral flag.
     const hasSubagentSourceFilter = sourceKinds.some((kind) =>
-      [
-        'subAgent',
-        'subAgentReview',
-        'subAgentCompact',
-        'subAgentThreadSpawn',
-        'subAgentOther',
-      ].includes(kind),
+      ['subAgent', 'subAgentThreadSpawn'].includes(kind),
     )
     const topologyQuery =
       parentThreadId != null || ancestorThreadId != null || hasSubagentSourceFilter

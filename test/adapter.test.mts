@@ -2776,16 +2776,11 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       'standard subagent discovery must return the child for its parent',
     )
 
-    // All standard subagent source-kind variants describe the same persisted
-    // child relationship in this adapter. The omitted sortKey also exercises
-    // the protocol default (created_at).
-    for (const [index, sourceKind] of [
-      'subAgent',
-      'subAgentReview',
-      'subAgentCompact',
-      'subAgentThreadSpawn',
-      'subAgentOther',
-    ].entries()) {
+    // Generic and thread-spawn source kinds are representable by this
+    // adapter. The omitted sortKey also exercises the protocol default
+    // (created_at). Other variants are intentionally unsupported because the
+    // persisted schema has no discriminator for them.
+    for (const [index, sourceKind] of ['subAgent', 'subAgentThreadSpawn'].entries()) {
       const id = 80 + index
       proc.stdin.write(
         json({
@@ -2803,6 +2798,26 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
         variant.result.data.map((thread: any) => thread.id),
         [childThreadId],
         `${sourceKind} should discover the subagent child`,
+      )
+    }
+    for (const [index, sourceKind] of [
+      'subAgentReview',
+      'subAgentCompact',
+      'subAgentOther',
+    ].entries()) {
+      const id = 90 + index
+      proc.stdin.write(
+        json({
+          id,
+          method: 'thread/list',
+          params: { parentThreadId: threadId, sourceKinds: [sourceKind], limit: 200 },
+        }),
+      )
+      const variant = await reader.nextResponse(id)
+      assert.deepEqual(
+        variant.result.data.map((thread: any) => thread.id),
+        [],
+        `${sourceKind} should not mislabel a thread-spawn child`,
       )
     }
   } finally {
