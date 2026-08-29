@@ -2576,7 +2576,7 @@ export class CodexClaudeAppServer {
       method: 'turn/completed',
       params: {
         threadId: context.childThreadId,
-        turn: this.toLifecycleTurn(completed),
+        turn: this.toCompletedTurn(completed),
       },
     })
     return completed
@@ -3691,15 +3691,33 @@ export class CodexClaudeAppServer {
   }
 
   private toThread(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const agentNickname = nullIfEmpty(thread.agentNickname)
+    const agentRole = nullIfEmpty(thread.agentRole)
+    const parentThreadId = thread.threadSource === 'subagent' ? thread.forkedFromId : null
+    const source = parentThreadId
+      ? {
+          subAgent: {
+            thread_spawn: {
+              parent_thread_id: parentThreadId,
+              depth: this.subagentDepth(thread),
+              agent_path: null,
+              agent_nickname: agentNickname,
+              agent_role: agentRole,
+            },
+          },
+        }
+      : normalizeSessionSource(thread.source)
     return {
       id: thread.id,
       sessionId: thread.sessionId,
       forkedFromId: thread.forkedFromId,
+      parentThreadId,
       preview: thread.preview,
       ephemeral: thread.ephemeral,
       modelProvider: thread.modelProvider,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
+      recencyAt: thread.updatedAt,
       status: thread.status,
       path: null,
       cwd: thread.cwd,
@@ -3708,14 +3726,28 @@ export class CodexClaudeAppServer {
       // `threadSource` (legacy `app_server`, empty string from a buggy write
       // path), coerce on the way out so the App's strict deserializer never
       // sees a value outside the wire enum.
-      source: normalizeSessionSource(thread.source),
+      source,
       threadSource: normalizeThreadSource(thread.threadSource),
-      agentNickname: nullIfEmpty(thread.agentNickname),
-      agentRole: nullIfEmpty(thread.agentRole),
+      agentNickname,
+      agentRole,
       gitInfo: null,
       name: thread.name,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
+  }
+
+  private subagentDepth(thread: ThreadRecord): number {
+    let depth = thread.threadSource === 'subagent' ? 1 : 0
+    let ancestorId = thread.forkedFromId
+    const seen = new Set([thread.id])
+    while (ancestorId && !seen.has(ancestorId)) {
+      seen.add(ancestorId)
+      const ancestor = this.store.getThread(ancestorId)
+      if (!ancestor || ancestor.threadSource !== 'subagent') break
+      depth += 1
+      ancestorId = ancestor.forkedFromId
+    }
+    return depth
   }
 
   // Full turn payload for history reads (thread/read, turns/list) — carries the
@@ -3754,16 +3786,36 @@ export class CodexClaudeAppServer {
     }
   }
 
-  // Turn payload for the turn lifecycle surface (turn/start response,
-  // turn/started, turn/completed). The real codex app-server deliberately ships
-  // an empty `items` list with `itemsView: "notLoaded"` here: the App's timeline
-  // is driven by the item/* event stream, not by items embedded in these turn
-  // envelopes. Re-shipping the full item list risks duplicate rendering.
+  // Lightweight payload for turn/start, turn/started, and terminal paths that
+  // intentionally do not carry an assistant summary. The item stream drives
+  // the timeline; completed subagent turns use toCompletedTurn below.
   private toLifecycleTurn(turn: TurnRecord, items: ThreadItem[] = []): unknown {
     return {
       id: turn.id,
       items,
       itemsView: 'notLoaded',
+      status: turn.status,
+      error: turn.error,
+      startedAt: turn.startedAt,
+      completedAt: turn.completedAt,
+      durationMs: turn.durationMs,
+    }
+  }
+
+  // Codex includes the final assistant message in successful turn/completed
+  // notifications. Subagent pages depend on that summary because they can be
+  // opened with a metadata-only thread/read and may not replay prior deltas.
+  private toCompletedTurn(turn: TurnRecord): unknown {
+    const lastAgent =
+      turn.status === 'completed' && turn.error == null
+        ? turn.items.findLast(
+            (item) => item.type === 'agentMessage' && item.text.trim().length > 0,
+          )
+        : undefined
+    return {
+      id: turn.id,
+      items: lastAgent ? [lastAgent] : [],
+      itemsView: lastAgent ? 'summary' : 'notLoaded',
       status: turn.status,
       error: turn.error,
       startedAt: turn.startedAt,

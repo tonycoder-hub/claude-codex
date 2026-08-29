@@ -246,12 +246,10 @@ test('run registry records thread and turn lifecycle without raw prompt or respo
   }
 })
 
-test('turn lifecycle envelopes carry empty notLoaded items like the real app-server', async () => {
-  // The real codex app-server ships `items: [], itemsView: "notLoaded"` in the
-  // turn/start response and the turn/started + turn/completed notifications; the
-  // timeline is driven by the item/* event stream. See codex-rs
-  // bespoke_event_handling.rs (turn started clears items; turn completed builds
-  // items: vec![]) and turn_processor.rs (TurnStartResponse turn is empty).
+test('primary turn lifecycle keeps lightweight notLoaded envelopes', async () => {
+  // turn/start and turn/started are metadata-only. Primary-thread completion
+  // remains item-stream driven here; subagent completion is covered separately
+  // because its terminal envelope must carry the final response for review UI.
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2604,6 +2602,23 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     const childThreadId = spawnEnd.receiverThreadIds[0]!
     assert.ok(childThreadStarted, 'subagent must emit child thread/started for live navigation')
     assert.equal(childThreadStarted.id, childThreadId)
+    assert.equal(
+      childThreadStarted.parentThreadId,
+      threadId,
+      'subagent thread metadata must identify its parent thread',
+    )
+    assert.equal(childThreadStarted.recencyAt, childThreadStarted.updatedAt)
+    assert.deepEqual(childThreadStarted.source, {
+      subAgent: {
+        thread_spawn: {
+          parent_thread_id: threadId,
+          depth: 1,
+          agent_path: null,
+          agent_nickname: childThreadStarted.agentNickname,
+          agent_role: 'general-purpose',
+        },
+      },
+    })
     assert.ok(childTurnStarted, 'subagent must emit child turn/started before its result')
     assert.equal(childTurnStarted.status, 'inProgress')
     assert.equal(childTurnStarted.itemsView, 'notLoaded')
@@ -2632,8 +2647,15 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     )
     assert.equal(childTurnCompleted.id, childTurnStarted.id)
     assert.equal(childTurnCompleted.status, 'completed')
-    assert.equal(childTurnCompleted.itemsView, 'notLoaded')
-    assert.deepEqual(childTurnCompleted.items, [])
+    assert.equal(
+      childTurnCompleted.itemsView,
+      'summary',
+      'completed subagent turns must carry their final response in the terminal envelope',
+    )
+    assert.equal(childTurnCompleted.items.length, 1)
+    assert.equal(childTurnCompleted.items[0].type, 'agentMessage')
+    assert.equal(childTurnCompleted.items[0].id, childAgentCompleted.id)
+    assert.match(childTurnCompleted.items[0].text, /subagent final summary/)
     // After spawnAgent ends the subagent is now running; only wait/closeAgent
     // ends report the agent as completed.
     assert.equal(spawnEnd.agentsStates[childThreadId]!.status, 'running')
@@ -2767,6 +2789,7 @@ test('subagent without a terminal result is closed as failed', async () => {
     let childThreadId = ''
     let waitStatus = ''
     let closeStatus = ''
+    let childTurnCompleted: any = null
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/completed') {
@@ -2777,12 +2800,18 @@ test('subagent without a terminal result is closed as failed', async () => {
         if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent')
           closeStatus = item.status
       }
+      if (message.method === 'turn/completed' && message.params.threadId !== threadId)
+        childTurnCompleted = message.params.turn
       if (message.method === 'turn/completed' && message.params.threadId === threadId) break
     }
 
     assert.ok(childThreadId)
     assert.equal(waitStatus, 'failed')
     assert.equal(closeStatus, 'failed')
+    assert.ok(childTurnCompleted)
+    assert.equal(childTurnCompleted.status, 'failed')
+    assert.equal(childTurnCompleted.itemsView, 'notLoaded')
+    assert.deepEqual(childTurnCompleted.items, [])
     proc.stdin.write(
       json({ id: 3, method: 'thread/turns/list', params: { threadId: childThreadId } }),
     )
