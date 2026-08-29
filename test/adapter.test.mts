@@ -2752,6 +2752,29 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       allIds.includes(childThreadId),
       'includeEphemeral=true should surface the subagent child thread',
     )
+
+    // Codex App discovers subagents after reconnect through the standard
+    // parent/source filters, without setting includeEphemeral explicitly.
+    proc.stdin.write(
+      json({
+        id: 7,
+        method: 'thread/list',
+        params: {
+          parentThreadId: threadId,
+          sourceKinds: ['subAgentThreadSpawn'],
+          sortDirection: 'desc',
+          sortKey: 'created_at',
+          useStateDbOnly: true,
+          limit: 200,
+        },
+      }),
+    )
+    const discovered = await reader.nextResponse(7)
+    assert.deepEqual(
+      discovered.result.data.map((thread: any) => thread.id),
+      [childThreadId],
+      'standard subagent discovery must return the child for its parent',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

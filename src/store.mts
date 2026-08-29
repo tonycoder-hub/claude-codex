@@ -183,30 +183,87 @@ export class SessionStore {
       cursor?: string | null
       cwd?: string | string[] | null
       includeEphemeral?: boolean
+      parentThreadId?: string | null
+      ancestorThreadId?: string | null
+      sourceKinds?: string[]
+      sortKey?: 'created_at' | 'updated_at'
+      sortDirection?: 'asc' | 'desc'
     } = {},
   ): ThreadRecord[] {
     const limit = Math.max(1, Math.min(Number(options.limit ?? 50), 200))
     const archived = options.archived === true ? 1 : 0
-    const cursor = options.cursor ? Number(options.cursor) : Number.MAX_SAFE_INTEGER
+    const sortKey = options.sortKey === 'created_at' ? 'created_at' : 'updated_at'
+    const sortDirection = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
+    const cursor = options.cursor
+      ? Number(options.cursor)
+      : sortDirection === 'ASC'
+        ? -1
+        : Number.MAX_SAFE_INTEGER
+    const where = ['t.archived = ?', `t.${sortKey} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
+    const args: unknown[] = [archived, cursor]
+    const parentThreadId = options.parentThreadId ?? null
+    const ancestorThreadId = options.ancestorThreadId ?? null
+    const sourceKinds = options.sourceKinds ?? []
+
+    if (parentThreadId != null) {
+      where.push('t.forked_from_id = ?')
+      args.push(parentThreadId)
+    }
+    if (ancestorThreadId != null) {
+      where.push('t.id IN (SELECT id FROM descendants)')
+    }
+
+    if (sourceKinds.length > 0) {
+      const predicates = sourceKinds.flatMap((kind) => {
+        switch (kind) {
+          case 'subAgentThreadSpawn':
+            return ["(t.thread_source = 'subagent' AND t.forked_from_id IS NOT NULL)"]
+          case 'user':
+            return ["t.thread_source = 'user'"]
+          case 'memoryConsolidation':
+            return ["t.thread_source = 'memory_consolidation'"]
+          case 'appServer':
+          case 'cli':
+          case 'exec':
+          case 'vscode':
+          case 'unknown':
+            return [`t.source = '${kind}'`]
+          default:
+            return []
+        }
+      })
+      where.push(predicates.length > 0 ? `(${predicates.join(' OR ')})` : '1 = 0')
+    }
+
     // Ephemeral threads (Codex App's internal title generators, subagent
     // children, memory-consolidation runs) shouldn't appear in the user's
-    // session list. Callers can opt back in for diagnostic flows.
-    const ephemeralFilter = options.includeEphemeral ? '' : ' AND ephemeral = 0'
+    // session list. Topology queries are the exception: Codex App asks for
+    // subagent descendants without sending our legacy includeEphemeral flag.
+    const topologyQuery =
+      parentThreadId != null || ancestorThreadId != null || sourceKinds.length > 0
+    if (!options.includeEphemeral && !topologyQuery) where.push('t.ephemeral = 0')
+
     const cwdList = Array.isArray(options.cwd) ? options.cwd : options.cwd ? [options.cwd] : []
     if (cwdList.length > 0) {
       const placeholders = cwdList.map(() => '?').join(',')
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM threads WHERE archived = ? AND updated_at < ? AND cwd IN (${placeholders})${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`,
-        )
-        .all(archived, cursor, ...cwdList, limit)
-      return rows.map((row: unknown) => this.rowToThread(row))
+      where.push(`t.cwd IN (${placeholders})`)
+      args.push(...cwdList)
     }
+
+    const cte =
+      ancestorThreadId == null
+        ? ''
+        : `WITH RECURSIVE descendants(id) AS (
+            SELECT id FROM threads WHERE forked_from_id = ?
+            UNION
+            SELECT child.id FROM threads child JOIN descendants parent ON child.forked_from_id = parent.id
+          )`
+    const queryArgs = ancestorThreadId == null ? args : [ancestorThreadId, ...args]
     const rows = this.db
       .prepare(
-        `SELECT * FROM threads WHERE archived = ? AND updated_at < ?${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`,
+        `${cte} SELECT t.* FROM threads t WHERE ${where.join(' AND ')} ORDER BY t.${sortKey} ${sortDirection}, t.id ${sortDirection} LIMIT ?`,
       )
-      .all(archived, cursor, limit)
+      .all(...queryArgs, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
   }
 

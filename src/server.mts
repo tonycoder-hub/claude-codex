@@ -741,6 +741,19 @@ export class CodexClaudeAppServer {
   }
 
   private threadList(params: Record<string, unknown>): unknown {
+    const sourceKinds = Array.isArray(params.sourceKinds)
+      ? params.sourceKinds.filter((value): value is string => typeof value === 'string')
+      : []
+    const parentThreadId =
+      typeof params.parentThreadId === 'string' && params.parentThreadId.length > 0
+        ? params.parentThreadId
+        : null
+    const ancestorThreadId =
+      typeof params.ancestorThreadId === 'string' && params.ancestorThreadId.length > 0
+        ? params.ancestorThreadId
+        : null
+    const sortKey = params.sortKey === 'created_at' ? 'created_at' : 'updated_at'
+    const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc'
     const threads = this.store.listThreads({
       archived: (params.archived as boolean | null | undefined) ?? null,
       limit: numberOr(params.limit, 50),
@@ -750,13 +763,22 @@ export class CodexClaudeAppServer {
           ? (params.cwd as string | string[])
           : null,
       includeEphemeral: params.includeEphemeral === true,
+      parentThreadId,
+      ancestorThreadId,
+      sourceKinds,
+      sortKey,
+      sortDirection,
     })
     const last = threads.at(-1)
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
       nextCursor:
-        last && threads.length >= numberOr(params.limit, 50) ? String(last.updatedAt) : null,
-      backwardsCursor: threads[0] ? String(threads[0].updatedAt) : null,
+        last && threads.length >= numberOr(params.limit, 50)
+          ? String(sortKey === 'created_at' ? last.createdAt : last.updatedAt)
+          : null,
+      backwardsCursor: threads[0]
+        ? String(sortKey === 'created_at' ? threads[0].createdAt : threads[0].updatedAt)
+        : null,
     }
   }
 
@@ -3808,9 +3830,7 @@ export class CodexClaudeAppServer {
   private toCompletedTurn(turn: TurnRecord): unknown {
     const lastAgent =
       turn.status === 'completed' && turn.error == null
-        ? turn.items.findLast(
-            (item) => item.type === 'agentMessage' && item.text.trim().length > 0,
-          )
+        ? turn.items.findLast((item) => item.type === 'agentMessage' && item.text.trim().length > 0)
         : undefined
     return {
       id: turn.id,
