@@ -273,6 +273,7 @@ export class MockRuntime implements ClaudeRuntime {
         toolName: 'Task',
         input: { description: 'mock subagent', prompt: 'investigate' },
       })
+      await sleep(75)
       await handlers.onEvent({
         type: 'text_delta',
         delta: 'subagent thinking aloud (should be hidden)',

@@ -123,6 +123,7 @@ type TurnItemsView = 'full' | 'summary' | 'notLoaded'
 
 interface SubagentContext {
   childThreadId: string
+  childTurnId: string
   waitItemId: string
   prompt: string
   subType: string | null
@@ -1730,6 +1731,7 @@ export class CodexClaudeAppServer {
             const childThreadId = newId()
             const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(0, 12)}`
             const agentRole = subType ?? 'general-purpose'
+            const childStartedAt = nowSeconds()
             const childThread: ThreadRecord = {
               id: childThreadId,
               sessionId: thread.sessionId,
@@ -1743,8 +1745,8 @@ export class CodexClaudeAppServer {
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
               source: normalizeSessionSource(thread.source),
-              createdAt: nowSeconds(),
-              updatedAt: nowSeconds(),
+              createdAt: childStartedAt,
+              updatedAt: childStartedAt,
               status: { type: 'active', activeFlags: [] },
               approvalPolicy: thread.approvalPolicy,
               sandboxMode: thread.sandboxMode,
@@ -1764,6 +1766,35 @@ export class CodexClaudeAppServer {
               codexSessionId: null,
             }
             this.store.upsertThread(childThread)
+            const childTurn: TurnRecord = {
+              id: newId(),
+              threadId: childThreadId,
+              status: 'inProgress',
+              startedAt: childStartedAt,
+              completedAt: null,
+              durationMs: null,
+              items: [
+                {
+                  type: 'userMessage',
+                  id: newId(),
+                  content: [{ type: 'text', text: promptText, text_elements: [] }],
+                },
+              ],
+              diff: '',
+              error: null,
+            }
+            this.store.upsertTurn(childTurn)
+            this.notify(peer, {
+              method: 'thread/started',
+              params: { thread: this.toThread(childThread, []) },
+            })
+            this.notify(peer, {
+              method: 'turn/started',
+              params: {
+                threadId: childThreadId,
+                turn: this.toLifecycleTurn(childTurn),
+              },
+            })
             recordRunEvent('subagent.spawned', {
               parentThreadId: thread.id,
               parentTurnId: turn.id,
@@ -1856,6 +1887,7 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, waitId)
             subagentContexts.set(event.toolUseId, {
               childThreadId,
+              childTurnId: childTurn.id,
               waitItemId: waitId,
               prompt: promptText,
               subType,
@@ -1882,36 +1914,14 @@ export class CodexClaudeAppServer {
             const parsed = parseSubagentTrailer(rawResultText)
             const resultText = parsed.cleanText
 
-            // Materialize a one-turn transcript on the child thread so the
-            // Codex App can drill in from the parent collabAgentToolCall.
-            const childTurn: TurnRecord = {
-              id: newId(),
-              threadId: ctx.childThreadId,
-              status: event.isError ? 'failed' : 'completed',
-              startedAt: nowSeconds(),
-              completedAt: nowSeconds(),
-              durationMs: parsed.usage?.durationMs ?? 0,
-              items: [
-                {
-                  type: 'userMessage',
-                  id: newId(),
-                  content: [{ type: 'text', text: ctx.prompt, text_elements: [] }],
-                },
-                {
-                  type: 'agentMessage',
-                  id: newId(),
-                  text: resultText,
-                  phase: null,
-                  memoryCitation: null,
-                },
-              ],
-              diff: '',
-              error: event.isError ? { message: 'subagent failed' } : null,
-              apiDurationMs: parsed.usage?.durationMs ?? null,
-              numTurns: parsed.usage?.toolUses ?? null,
-              costUsd: null,
-            }
-            this.store.upsertTurn(childTurn)
+            const childTurn = this.completeSubagentChildTurn(
+              peer,
+              ctx,
+              resultText,
+              event.isError ? 'failed' : 'completed',
+              event.isError ? { message: 'subagent failed' } : null,
+              parsed.usage?.durationMs ?? null,
+            )
             recordRunEvent('subagent.completed', {
               parentThreadId: thread.id,
               parentTurnId: turn.id,
@@ -1922,7 +1932,6 @@ export class CodexClaudeAppServer {
             })
             const childThread = this.store.getThread(ctx.childThreadId)
             if (childThread) {
-              childThread.status = { type: 'idle' }
               childThread.updatedAt = nowSeconds()
               // Replace our synthetic `agent-{hex}` nickname with the SDK-
               // assigned id so SendMessage / SubAgent navigation in the App
@@ -2485,6 +2494,94 @@ export class CodexClaudeAppServer {
     })
   }
 
+  private completeSubagentChildTurn(
+    peer: RpcPeer,
+    context: SubagentContext,
+    resultText: string,
+    status: 'completed' | 'failed',
+    error: unknown | null,
+    durationMs: number | null = null,
+  ): TurnRecord {
+    let childTurn = this.store.getTurn(context.childTurnId)
+    if (!childTurn) {
+      childTurn = {
+        id: context.childTurnId,
+        threadId: context.childThreadId,
+        status: 'inProgress',
+        startedAt: nowSeconds(),
+        completedAt: null,
+        durationMs: null,
+        items: [
+          {
+            type: 'userMessage',
+            id: newId(),
+            content: [{ type: 'text', text: context.prompt, text_elements: [] }],
+          },
+        ],
+        diff: '',
+        error: null,
+      }
+      this.store.upsertTurn(childTurn)
+    }
+
+    const agentItemId = newId()
+    const startedItem: ThreadItem = {
+      type: 'agentMessage',
+      id: agentItemId,
+      text: '',
+      phase: null,
+      memoryCitation: null,
+    }
+    this.store.appendItem(childTurn.id, startedItem)
+    this.notify(peer, {
+      method: 'item/started',
+      params: {
+        threadId: context.childThreadId,
+        turnId: childTurn.id,
+        item: startedItem,
+        startedAtMs: nowMillis(),
+      },
+    })
+
+    const completedItem: ThreadItem = { ...startedItem, text: resultText }
+    this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
+    if (resultText) {
+      this.notify(peer, {
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId: context.childThreadId,
+          turnId: childTurn.id,
+          itemId: agentItemId,
+          delta: resultText,
+        },
+      })
+    }
+    this.notify(peer, {
+      method: 'item/completed',
+      params: {
+        threadId: context.childThreadId,
+        turnId: childTurn.id,
+        item: completedItem,
+        completedAtMs: nowMillis(),
+      },
+    })
+
+    const completed = this.store.completeTurn(childTurn.id, status, error) ?? childTurn
+    if (durationMs != null) {
+      completed.durationMs = durationMs
+      this.store.upsertTurn(completed)
+    }
+    this.setThreadStatus(peer, context.childThreadId, { type: 'idle' })
+    this.notify(peer, {
+      method: 'turn/completed',
+      params: {
+        threadId: context.childThreadId,
+        turn: this.toLifecycleTurn(completed),
+      },
+    })
+    return completed
+  }
+
   private finalizeOrphanedSubagents(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -2499,38 +2596,9 @@ export class CodexClaudeAppServer {
       if (!context) continue
 
       const message = 'Subagent ended without a terminal task result.'
-      const now = nowSeconds()
-      const childTurn: TurnRecord = {
-        id: newId(),
-        threadId: context.childThreadId,
-        status: 'failed',
-        startedAt: now,
-        completedAt: now,
-        durationMs: 0,
-        items: [
-          {
-            type: 'userMessage',
-            id: newId(),
-            content: [{ type: 'text', text: context.prompt, text_elements: [] }],
-          },
-          {
-            type: 'agentMessage',
-            id: newId(),
-            text: message,
-            phase: null,
-            memoryCitation: null,
-          },
-        ],
-        diff: '',
-        error: { message },
-      }
-      this.store.upsertTurn(childTurn)
-      const childThread = this.store.getThread(context.childThreadId)
-      if (childThread) {
-        childThread.status = { type: 'idle' }
-        childThread.updatedAt = now
-        this.store.upsertThread(childThread)
-      }
+      const childTurn = this.completeSubagentChildTurn(peer, context, message, 'failed', {
+        message,
+      })
       recordRunEvent('subagent.completed', {
         parentThreadId: thread.id,
         parentTurnId: turn.id,

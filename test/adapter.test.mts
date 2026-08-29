@@ -2518,12 +2518,38 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     type Lifecycle = { started?: any; completed?: any }
     const collabByTool: Record<string, Lifecycle> = {}
     let agentMessageText = ''
+    let childThreadStarted: any = null
+    let childTurnStarted: any = null
+    let childAgentStarted: any = null
+    let childAgentCompleted: any = null
+    let childAgentMessageText = ''
+    let childTurnCompleted: any = null
+    let liveChildRead: any = null
     let leakedInnerItems = 0
     for (let i = 0; i < 300; i += 1) {
       const message = await reader.next()
+      if (message.id === 50) liveChildRead = message.result.thread
+      if (
+        message.method === 'thread/started' &&
+        message.params.thread?.threadSource === 'subagent'
+      ) {
+        childThreadStarted = message.params.thread
+      }
+      if (message.method === 'turn/started' && message.params.threadId !== threadId) {
+        childTurnStarted = message.params.turn
+        proc.stdin.write(
+          json({
+            id: 50,
+            method: 'thread/read',
+            params: { threadId: message.params.threadId, includeTurns: true },
+          }),
+        )
+      }
       if (message.method === 'item/started') {
         const item = message.params.item
-        if (item.type === 'collabAgentToolCall') {
+        if (message.params.threadId !== threadId && item.type === 'agentMessage') {
+          childAgentStarted = item
+        } else if (item.type === 'collabAgentToolCall') {
           const bucket = (collabByTool[item.tool] ??= {})
           bucket.started = item
         } else if (
@@ -2535,14 +2561,24 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       }
       if (message.method === 'item/completed') {
         const item = message.params.item
-        if (item.type === 'collabAgentToolCall') {
+        if (message.params.threadId !== threadId && item.type === 'agentMessage') {
+          childAgentCompleted = item
+        } else if (item.type === 'collabAgentToolCall') {
           const bucket = (collabByTool[item.tool] ??= {})
           bucket.completed = item
         }
       }
-      if (message.method === 'item/agentMessage/delta')
-        agentMessageText += String(message.params.delta ?? '')
-      if (message.method === 'turn/completed') break
+      if (message.method === 'item/agentMessage/delta') {
+        if (message.params.threadId === threadId) {
+          agentMessageText += String(message.params.delta ?? '')
+        } else {
+          childAgentMessageText += String(message.params.delta ?? '')
+        }
+      }
+      if (message.method === 'turn/completed') {
+        if (message.params.threadId === threadId) break
+        childTurnCompleted = message.params.turn
+      }
     }
 
     // All three native lifecycle pairs must appear, each with a started AND
@@ -2566,6 +2602,38 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       'spawnAgent end should reference exactly one child thread',
     )
     const childThreadId = spawnEnd.receiverThreadIds[0]!
+    assert.ok(childThreadStarted, 'subagent must emit child thread/started for live navigation')
+    assert.equal(childThreadStarted.id, childThreadId)
+    assert.ok(childTurnStarted, 'subagent must emit child turn/started before its result')
+    assert.equal(childTurnStarted.status, 'inProgress')
+    assert.equal(childTurnStarted.itemsView, 'notLoaded')
+    assert.deepEqual(childTurnStarted.items, [])
+    assert.ok(liveChildRead, 'opening a running subagent must return its child turn')
+    assert.equal(liveChildRead.turns.length, 1)
+    assert.equal(liveChildRead.turns[0].status, 'inProgress')
+    const liveItems = liveChildRead.turns[0].items
+    assert.equal(
+      liveItems.find((item: any) => item.type === 'userMessage').content[0].text,
+      'investigate',
+    )
+    assert.equal(
+      liveItems.some((item: any) => item.type === 'agentMessage'),
+      false,
+    )
+    assert.ok(childAgentStarted, 'subagent result must emit child agentMessage item/started')
+    assert.equal(childAgentStarted.text, '')
+    assert.match(childAgentMessageText, /subagent final summary/)
+    assert.ok(childAgentCompleted, 'subagent result must emit child agentMessage item/completed')
+    assert.equal(childAgentCompleted.id, childAgentStarted.id)
+    assert.match(childAgentCompleted.text, /subagent final summary/)
+    assert.ok(
+      childTurnCompleted,
+      'subagent must emit child turn/completed before parent completion',
+    )
+    assert.equal(childTurnCompleted.id, childTurnStarted.id)
+    assert.equal(childTurnCompleted.status, 'completed')
+    assert.equal(childTurnCompleted.itemsView, 'notLoaded')
+    assert.deepEqual(childTurnCompleted.items, [])
     // After spawnAgent ends the subagent is now running; only wait/closeAgent
     // ends report the agent as completed.
     assert.equal(spawnEnd.agentsStates[childThreadId]!.status, 'running')
@@ -2611,7 +2679,10 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       json({ id: 6, method: 'thread/turns/list', params: { threadId: childThreadId } }),
     )
     const childTurns = await reader.nextResponse(6)
+    assert.equal(childTurns.result.data.length, 1, 'subagent should use one live child turn')
     const childTurnItems = (childTurns.result.data[0] as any).items
+    const childPrompt = childTurnItems.find((i: any) => i.type === 'userMessage')
+    assert.equal(childPrompt.content[0].text, 'investigate')
     const childAgent = childTurnItems.find((i: any) => i.type === 'agentMessage')
     assert.ok(childAgent, 'child thread should have an agentMessage with the subagent result')
     assert.doesNotMatch(
@@ -2706,7 +2777,7 @@ test('subagent without a terminal result is closed as failed', async () => {
         if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent')
           closeStatus = item.status
       }
-      if (message.method === 'turn/completed') break
+      if (message.method === 'turn/completed' && message.params.threadId === threadId) break
     }
 
     assert.ok(childThreadId)
@@ -2751,7 +2822,8 @@ test('bare /workflows lists prior workflow runs without invoking the model', asy
     )
     await reader.nextResponse(2)
     for (let i = 0; i < 300; i += 1) {
-      if ((await reader.next()).method === 'turn/completed') break
+      const message = await reader.next()
+      if (message.method === 'turn/completed' && message.params.threadId === threadId) break
     }
 
     proc.stdin.write(

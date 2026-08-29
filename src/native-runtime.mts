@@ -35,6 +35,12 @@ import type {
 } from './types.mjs'
 import { newId } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
+import {
+  defaultWorkflowTranscriptRoots,
+  parseWorkflowLaunchInfo,
+  WorkflowJournalMonitor,
+  type WorkflowLaunchInfo,
+} from './workflow-subagents.mjs'
 
 type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
 
@@ -54,6 +60,11 @@ interface PendingTurn {
   // timeline until the matching tool_result closes the parent Task.
   activeSubagents: Set<string>
   completedWorkflowTasks: Set<string>
+  workflowToolUseIds: Set<string>
+  workflowLaunches: Map<string, WorkflowLaunchInfo>
+  workflowTranscriptRoots: string[]
+  skippedWorkflowTaskIds: Set<string>
+  workflowTasks: Map<string, WorkflowTaskState>
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -64,6 +75,24 @@ interface PendingTurn {
   // text and emit only the final coerced JSON.
   structuredBuffer: string
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
+  deferredResult: PendingTurnResult | null
+}
+
+interface PendingTurnResult {
+  success: boolean
+  resultText: string | null
+  claudeSessionId: string | null
+}
+
+interface WorkflowTaskState {
+  taskId: string
+  toolUseId: string
+  workflowName: string
+  description: string
+  prompt: string
+  monitor: WorkflowJournalMonitor | null
+  aggregateStarted: boolean
+  terminal: boolean
 }
 
 interface PendingPermission {
@@ -75,6 +104,8 @@ interface PendingPermission {
 // content_block_delta envelope but distinguishes via delta.type.
 const STREAMED_TEXT = 'text'
 const STREAMED_THINKING = 'thinking'
+const WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS = 500
+const WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS = 3_000
 
 export class NativeClaudeRuntime implements ClaudeRuntime {
   private sdk: ClaudeSdk | null = null
@@ -105,9 +136,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         streamedThinking: false,
         activeSubagents: new Set(),
         completedWorkflowTasks: new Set(),
+        workflowToolUseIds: new Set(),
+        workflowLaunches: new Map(),
+        workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env),
+        skippedWorkflowTaskIds: new Set(),
+        workflowTasks: new Map(),
         toolStartSeen: new Set(),
         structuredBuffer: '',
         pendingUserMessage: null,
+        deferredResult: null,
       }
       this.turns.set(context.turnId, pending)
       // Kick off the receive loop in the background. We don't await it here
@@ -149,6 +186,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   async interrupt(threadId: string): Promise<void> {
     for (const pending of this.turns.values()) {
       if (pending.context.threadId === threadId) {
+        await this.stopWorkflowTasks(pending)
         pending.abort.abort()
         await pending.query.interrupt().catch(() => {})
       }
@@ -157,6 +195,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   async stop(): Promise<void> {
     for (const pending of this.turns.values()) {
+      await this.stopWorkflowTasks(pending)
       pending.abort.abort()
     }
     this.turns.clear()
@@ -368,10 +407,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await this.handleMessage(pending, message)
         if (pending.resolved) break
       }
+      if (!pending.resolved && pending.deferredResult) {
+        await this.finishDeferredResult(pending)
+        if (!pending.resolved) return
+      }
       // The async iterator finished without a 'result' message — treat as
       // successful empty turn (claude-agent-sdk does occasionally end without
       // a SDKResultMessage when interrupted cleanly).
       if (!pending.resolved) {
+        await this.stopWorkflowTasks(pending)
         pending.resolved = true
         this.turns.delete(context.turnId)
         try {
@@ -383,6 +427,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
     } catch (err) {
       if (!pending.resolved) {
+        await this.stopWorkflowTasks(pending)
         pending.resolved = true
         this.turns.delete(context.turnId)
         const error = err instanceof Error ? err : new Error(String(err))
@@ -447,44 +492,149 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (subtype === 'task_started' && isWorkflowBackgroundTask(message)) {
       const taskId = String(message.task_id ?? '')
-      if (!taskId || message.skip_transcript === true) return
-      const toolUseId = workflowTaskToolUseId(taskId)
-      if (pending.activeSubagents.has(toolUseId) || pending.completedWorkflowTasks.has(toolUseId))
+      if (!taskId) return
+      const sourceToolUseId = String(message.tool_use_id ?? '')
+      if (message.skip_transcript === true) {
+        const skipped =
+          pending.skippedWorkflowTaskIds ?? (pending.skippedWorkflowTaskIds = new Set())
+        skipped.add(taskId)
+        this.discardDeferredWorkflowLaunches(pending, taskId, sourceToolUseId)
+        const hiddenState = pending.workflowTasks?.get(taskId)
+        if (hiddenState) {
+          hiddenState.terminal = true
+          await hiddenState.monitor?.stop()
+          await this.closeWorkflowAgentLifecycles(
+            pending,
+            hiddenState,
+            'Workflow transcript was hidden before the agent completed.',
+            false,
+          )
+          await this.closeWorkflowAggregateLifecycle(
+            pending,
+            hiddenState,
+            'Workflow transcript was hidden.',
+            false,
+          )
+        }
+        await this.finishDeferredResult(pending)
         return
-      pending.activeSubagents.add(toolUseId)
-      const workflowName = String(message.workflow_name ?? '').trim()
-      const description = String(message.description ?? '').trim()
-      const prompt = String(message.prompt ?? '').trim() || description || workflowName
-      await pending.handlers.onEvent({
-        type: 'tool_use',
-        toolUseId,
-        toolName: 'Agent',
-        input: {
-          description: workflowName ? `Workflow: ${workflowName}` : 'Workflow',
-          prompt,
-          subagent_type: 'workflow',
-        },
-      })
+      }
+      const toolUseId = workflowTaskToolUseId(taskId)
+      if (pending.completedWorkflowTasks.has(toolUseId)) return
+      const state = this.ensureWorkflowTask(pending, taskId)
+      if (sourceToolUseId && !state.toolUseId) state.toolUseId = sourceToolUseId
+      state.workflowName = String(message.workflow_name ?? '').trim() || state.workflowName
+      state.description = String(message.description ?? '').trim() || state.description
+      state.prompt =
+        String(message.prompt ?? '').trim() ||
+        state.prompt ||
+        state.description ||
+        state.workflowName
+      this.attachDeferredWorkflowJournal(pending, state, sourceToolUseId)
       return
     }
     if (subtype === 'task_notification') {
       const taskId = String(message.task_id ?? '')
       if (!taskId) return
+      if (pending.skippedWorkflowTaskIds?.has(taskId)) {
+        this.discardDeferredWorkflowLaunches(pending, taskId, '')
+        const hiddenState = pending.workflowTasks?.get(taskId)
+        if (hiddenState) {
+          hiddenState.terminal = true
+          await hiddenState.monitor?.stop()
+          await this.closeWorkflowAgentLifecycles(
+            pending,
+            hiddenState,
+            'Workflow transcript was hidden before the agent completed.',
+            false,
+          )
+          await this.closeWorkflowAggregateLifecycle(
+            pending,
+            hiddenState,
+            'Workflow transcript was hidden.',
+            false,
+          )
+        }
+        await this.finishDeferredResult(pending)
+        return
+      }
+      const state = pending.workflowTasks?.get(taskId)
+      if (!state) return
+      if (message.skip_transcript === true) {
+        const skipped =
+          pending.skippedWorkflowTaskIds ?? (pending.skippedWorkflowTaskIds = new Set())
+        skipped.add(taskId)
+        this.discardDeferredWorkflowLaunches(pending, taskId, state.toolUseId)
+        state.terminal = true
+        await state.monitor?.stop()
+        await this.closeWorkflowAgentLifecycles(
+          pending,
+          state,
+          'Workflow transcript was hidden before the agent completed.',
+          false,
+        )
+        await this.closeWorkflowAggregateLifecycle(
+          pending,
+          state,
+          'Workflow transcript was hidden.',
+          false,
+        )
+        await this.finishDeferredResult(pending)
+        return
+      }
       const toolUseId = workflowTaskToolUseId(taskId)
-      if (!pending.activeSubagents.delete(toolUseId)) return
-      pending.completedWorkflowTasks.add(toolUseId)
+      if (pending.completedWorkflowTasks.has(toolUseId)) {
+        state.terminal = true
+        await this.finishDeferredResult(pending)
+        return
+      }
       const status = String(message.status ?? '')
       const summary = String(message.summary ?? '').trim() || `Workflow ${status || 'finished'}`
       const usage = workflowTaskUsage(message.usage)
       const trailer = usage
         ? `\n<usage>total_tokens: ${usage.totalTokens}\ntool_uses: ${usage.toolUses}\nduration_ms: ${usage.durationMs}</usage>`
         : ''
+      if (state.monitor && !state.aggregateStarted) {
+        await settlesWithin(state.monitor.flush(), WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS)
+        await state.monitor.drain(WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS)
+        const projectedBeforeStop = this.workflowProjectedAgentIds(pending, state)
+        if (state.monitor.startedCount > 0 || projectedBeforeStop.length > 0) {
+          state.terminal = true
+        }
+        await state.monitor.stop()
+        const projectedAgentIds = this.workflowProjectedAgentIds(pending, state)
+        if (state.monitor.startedCount > 0 || projectedAgentIds.length > 0) {
+          state.terminal = true
+          await this.closeWorkflowAgentLifecycles(
+            pending,
+            state,
+            status === 'completed'
+              ? `Workflow completed before the individual transcript result became visible.\n${summary}`
+              : `Workflow ended before the agent published an individual result.\n${summary}`,
+            status !== 'completed',
+          )
+          pending.completedWorkflowTasks.add(toolUseId)
+          await pending.handlers.onEvent({
+            type: 'notice',
+            level: status === 'completed' ? 'info' : 'warning',
+            message: `${state.workflowName || `Workflow ${taskId}`}: ${summary}${trailer}`,
+          })
+          await this.finishDeferredResult(pending)
+          return
+        }
+      }
+
+      await this.ensureWorkflowAggregateStarted(pending, state)
+      if (!pending.activeSubagents.delete(toolUseId)) return
+      pending.completedWorkflowTasks.add(toolUseId)
+      state.terminal = true
       await pending.handlers.onEvent({
         type: 'tool_result',
         toolUseId,
         content: `${summary}${trailer}`,
         isError: status !== 'completed',
       })
+      await this.finishDeferredResult(pending)
     }
   }
 
@@ -577,6 +727,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           continue
         }
         await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
+        if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
       }
     }
   }
@@ -585,13 +736,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // The SDK delivers tool_result blocks as a 'user' message turn from the
     // CLI's perspective. Surface them so the server can update the matching
     // tool item.
+    const workflowLaunchResult =
+      message.tool_use_result ?? (message as Record<string, unknown>).toolUseResult
+    let workflowLaunchAttached = false
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
     const content = (inner.content as Array<Record<string, unknown>>) || []
+    const toolResultCount = content.filter((block) => String(block.type) === 'tool_result').length
     for (const block of content) {
       if (String(block.type) !== 'tool_result') continue
       const toolUseId = String(block.tool_use_id ?? '')
       if (!toolUseId) continue
+      const isWorkflowLaunch = pending.workflowToolUseIds?.delete(toolUseId) === true
       const wasSubagent = pending.activeSubagents.delete(toolUseId)
       // Even if this was a subagent we still emit its tool_result so the
       // server's subagent state machine closes the collabAgentToolCall.
@@ -603,7 +759,287 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         content: bodyContent,
         isError,
       })
+      if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
+        workflowLaunchAttached = true
+        this.attachWorkflowJournal(pending, workflowLaunchResult, toolUseId)
+      }
       void wasSubagent
+    }
+  }
+
+  private attachWorkflowJournal(pending: PendingTurn, value: unknown, toolUseId: string): void {
+    const launch = parseWorkflowLaunchInfo(
+      value,
+      pending.workflowTranscriptRoots ?? defaultWorkflowTranscriptRoots(process.env),
+    )
+    if (!launch) return
+    if (pending.skippedWorkflowTaskIds?.has(launch.taskId)) return
+    const state = pending.workflowTasks?.get(launch.taskId)
+    if (!state) {
+      const boundState = [...(pending.workflowTasks?.values() ?? [])].find(
+        (candidate) => candidate.toolUseId === toolUseId,
+      )
+      if (boundState) return
+      const launches = pending.workflowLaunches ?? (pending.workflowLaunches = new Map())
+      launches.set(toolUseId, launch)
+      return
+    }
+    this.attachParsedWorkflowJournal(pending, state, launch, toolUseId)
+  }
+
+  private attachParsedWorkflowJournal(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+    launch: WorkflowLaunchInfo,
+    toolUseId: string,
+  ): void {
+    if (launch.taskId !== state.taskId) return
+    if (state.toolUseId && state.toolUseId !== toolUseId) return
+    if (!state.toolUseId) state.toolUseId = toolUseId
+    state.workflowName = launch.workflowName || state.workflowName
+    state.description = launch.summary || state.description
+    state.prompt = state.prompt || state.description || state.workflowName
+    if (state.terminal || state.aggregateStarted || state.monitor) return
+
+    state.monitor = this.createWorkflowMonitor(pending, state, launch)
+    state.monitor.start()
+  }
+
+  private attachDeferredWorkflowJournal(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+    sourceToolUseId: string,
+  ): void {
+    const launches = pending.workflowLaunches
+    if (!launches || launches.size === 0) return
+    if (sourceToolUseId) {
+      const launch = launches.get(sourceToolUseId)
+      if (!launch) return
+      launches.delete(sourceToolUseId)
+      this.attachParsedWorkflowJournal(pending, state, launch, sourceToolUseId)
+      return
+    }
+    const matches = [...launches.entries()].filter(([, launch]) => launch.taskId === state.taskId)
+    if (matches.length !== 1) return
+    const match = matches[0]
+    if (!match) return
+    const [toolUseId, launch] = match
+    launches.delete(toolUseId)
+    this.attachParsedWorkflowJournal(pending, state, launch, toolUseId)
+  }
+
+  private discardDeferredWorkflowLaunches(
+    pending: PendingTurn,
+    taskId: string,
+    sourceToolUseId: string,
+  ): void {
+    const launches = pending.workflowLaunches
+    if (!launches) return
+    if (sourceToolUseId) launches.delete(sourceToolUseId)
+    for (const [toolUseId, launch] of launches) {
+      if (launch.taskId === taskId) launches.delete(toolUseId)
+    }
+  }
+
+  private createWorkflowMonitor(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+    launch: WorkflowLaunchInfo,
+  ): WorkflowJournalMonitor {
+    return new WorkflowJournalMonitor({
+      launch,
+      onStarted: async (agent) => {
+        if (state.terminal) return
+        const toolUseId = workflowAgentToolUseId(state.taskId, agent.agentId)
+        if (
+          pending.activeSubagents.has(toolUseId) ||
+          pending.completedWorkflowTasks.has(toolUseId)
+        ) {
+          return
+        }
+        pending.activeSubagents.add(toolUseId)
+        try {
+          await pending.handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Agent',
+            input: {
+              description: agent.description,
+              prompt: agent.prompt,
+              subagent_type: 'workflow',
+            },
+          })
+        } catch (error) {
+          pending.activeSubagents.delete(toolUseId)
+          throw error
+        }
+      },
+      onResult: async (agent) => {
+        if (state.terminal) return
+        const toolUseId = workflowAgentToolUseId(state.taskId, agent.agentId)
+        if (!pending.activeSubagents.has(toolUseId)) return
+        await pending.handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: agent.content,
+          isError: agent.isError,
+        })
+        pending.activeSubagents.delete(toolUseId)
+        pending.completedWorkflowTasks.add(toolUseId)
+      },
+    })
+  }
+
+  private workflowProjectedAgentIds(pending: PendingTurn, state: WorkflowTaskState): string[] {
+    const agentIds = new Set(state.monitor?.activeAgentIds() ?? [])
+    const prefix = `workflow-agent:${state.taskId}:`
+    for (const toolUseId of pending.activeSubagents) {
+      if (!toolUseId.startsWith(prefix)) continue
+      const agentId = toolUseId.slice(prefix.length)
+      if (agentId) agentIds.add(agentId)
+    }
+    return [...agentIds]
+  }
+
+  private async closeWorkflowAgentLifecycles(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+    message: string,
+    isError: boolean,
+  ): Promise<number> {
+    let closed = 0
+    for (const agentId of this.workflowProjectedAgentIds(pending, state)) {
+      const toolUseId = workflowAgentToolUseId(state.taskId, agentId)
+      if (!pending.activeSubagents.delete(toolUseId)) continue
+      pending.completedWorkflowTasks.add(toolUseId)
+      await pending.handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `${message}\nagentId: ${agentId}`,
+        isError,
+      })
+      closed += 1
+    }
+    return closed
+  }
+
+  private async closeWorkflowAggregateLifecycle(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+    message: string,
+    isError: boolean,
+  ): Promise<boolean> {
+    const toolUseId = workflowTaskToolUseId(state.taskId)
+    if (!pending.activeSubagents.delete(toolUseId)) return false
+    pending.completedWorkflowTasks.add(toolUseId)
+    await pending.handlers.onEvent({
+      type: 'tool_result',
+      toolUseId,
+      content: message,
+      isError,
+    })
+    return true
+  }
+
+  private ensureWorkflowTask(pending: PendingTurn, taskId: string): WorkflowTaskState {
+    const tasks = pending.workflowTasks ?? (pending.workflowTasks = new Map())
+    const existing = tasks.get(taskId)
+    if (existing) return existing
+    const state: WorkflowTaskState = {
+      taskId,
+      toolUseId: '',
+      workflowName: '',
+      description: '',
+      prompt: '',
+      monitor: null,
+      aggregateStarted: false,
+      terminal: false,
+    }
+    tasks.set(taskId, state)
+    return state
+  }
+
+  private async ensureWorkflowAggregateStarted(
+    pending: PendingTurn,
+    state: WorkflowTaskState,
+  ): Promise<void> {
+    if (state.terminal || state.aggregateStarted) return
+    const toolUseId = workflowTaskToolUseId(state.taskId)
+    if (pending.completedWorkflowTasks.has(toolUseId)) return
+    state.aggregateStarted = true
+    pending.activeSubagents.add(toolUseId)
+    try {
+      await pending.handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: {
+          description: state.workflowName ? `Workflow: ${state.workflowName}` : 'Workflow',
+          prompt: state.prompt || state.description || state.workflowName || 'Workflow',
+          subagent_type: 'workflow',
+        },
+      })
+    } catch (error) {
+      state.aggregateStarted = false
+      pending.activeSubagents.delete(toolUseId)
+      throw error
+    }
+  }
+
+  private async stopWorkflowTasks(pending: PendingTurn): Promise<void> {
+    const tasks = pending.workflowTasks
+    if (tasks) {
+      for (const state of tasks.values()) {
+        state.terminal = true
+        await state.monitor?.stop()
+        await this.closeWorkflowAgentLifecycles(
+          pending,
+          state,
+          'Workflow monitoring stopped before the agent published an individual result.',
+          true,
+        )
+        await this.closeWorkflowAggregateLifecycle(
+          pending,
+          state,
+          'Workflow monitoring stopped before the workflow published a terminal result.',
+          true,
+        )
+      }
+    }
+    pending.workflowLaunches?.clear()
+  }
+
+  private hasPendingWorkflowTasks(pending: PendingTurn): boolean {
+    if ((pending.workflowToolUseIds?.size ?? 0) > 0) return true
+    if ((pending.workflowLaunches?.size ?? 0) > 0) return true
+    for (const state of pending.workflowTasks?.values() ?? []) {
+      if (!state.terminal) return true
+    }
+    return false
+  }
+
+  private async finishDeferredResult(pending: PendingTurn): Promise<void> {
+    const deferred = pending.deferredResult
+    if (!deferred || pending.resolved) return
+    if (deferred.success && this.hasPendingWorkflowTasks(pending)) return
+
+    pending.deferredResult = null
+    pending.resolved = true
+    this.turns.delete(pending.context.turnId)
+    try {
+      await pending.handlers.onEvent({
+        type: 'completed',
+        success: deferred.success,
+        result: deferred.resultText,
+        claudeSessionId: deferred.claudeSessionId,
+      })
+      if (deferred.success) {
+        pending.resolve()
+      } else {
+        pending.reject(new Error(deferred.resultText ?? 'Claude turn failed'))
+      }
+    } catch (err) {
+      pending.reject(err instanceof Error ? err : new Error(String(err)))
     }
   }
 
@@ -611,6 +1047,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     pending: PendingTurn,
     message: Record<string, unknown>,
   ): Promise<void> {
+    if (pending.deferredResult || pending.resolved) return
     const subtype = String(message.subtype ?? '')
     const success = subtype === 'success' && !message.is_error
     const resultText = message.result == null ? null : String(message.result)
@@ -632,23 +1069,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (pending.context.outputFormat && pending.structuredBuffer) {
       await pending.handlers.onEvent({ type: 'text_delta', delta: pending.structuredBuffer.trim() })
     }
-    pending.resolved = true
-    this.turns.delete(pending.context.turnId)
-    try {
-      await pending.handlers.onEvent({
-        type: 'completed',
-        success,
-        result: resultText,
-        claudeSessionId,
-      })
-      if (success) {
-        pending.resolve()
-      } else {
-        pending.reject(new Error(resultText ?? 'Claude turn failed'))
-      }
-    } catch (err) {
-      pending.reject(err instanceof Error ? err : new Error(String(err)))
-    }
+    pending.deferredResult = { success, resultText, claudeSessionId }
+    if (!success) await this.stopWorkflowTasks(pending)
+    await this.finishDeferredResult(pending)
   }
 
   private async handleOther(
@@ -725,13 +1148,35 @@ function isSubagentTool(name: string): boolean {
   )
 }
 
+function isWorkflowTool(name: string): boolean {
+  return name === 'Workflow'
+}
+
 function isWorkflowBackgroundTask(message: Record<string, unknown>): boolean {
-  const taskType = String(message.task_type ?? '')
-  return taskType === 'local_workflow' || taskType === 'workflow'
+  return String(message.task_type ?? '') === 'local_workflow'
 }
 
 function workflowTaskToolUseId(taskId: string): string {
   return `workflow-task:${taskId}`
+}
+
+function workflowAgentToolUseId(taskId: string, agentId: string): string {
+  return `workflow-agent:${taskId}:${agentId}`
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  if (timeoutMs <= 0) return false
+  let timer: NodeJS.Timeout | null = null
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(false), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function workflowTaskUsage(value: unknown): {
