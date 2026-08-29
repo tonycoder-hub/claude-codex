@@ -752,7 +752,10 @@ export class CodexClaudeAppServer {
       typeof params.ancestorThreadId === 'string' && params.ancestorThreadId.length > 0
         ? params.ancestorThreadId
         : null
-    const sortKey = params.sortKey === 'created_at' ? 'created_at' : 'updated_at'
+    const sortKey =
+      params.sortKey === 'updated_at' || params.sortKey === 'recency_at'
+        ? params.sortKey
+        : 'created_at'
     const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc'
     const threads = this.store.listThreads({
       archived: (params.archived as boolean | null | undefined) ?? null,

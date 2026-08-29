@@ -2775,6 +2775,36 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       [childThreadId],
       'standard subagent discovery must return the child for its parent',
     )
+
+    // All standard subagent source-kind variants describe the same persisted
+    // child relationship in this adapter. The omitted sortKey also exercises
+    // the protocol default (created_at).
+    for (const [index, sourceKind] of [
+      'subAgent',
+      'subAgentReview',
+      'subAgentCompact',
+      'subAgentThreadSpawn',
+      'subAgentOther',
+    ].entries()) {
+      const id = 80 + index
+      proc.stdin.write(
+        json({
+          id,
+          method: 'thread/list',
+          params: {
+            parentThreadId: threadId,
+            sourceKinds: [sourceKind],
+            limit: 200,
+          },
+        }),
+      )
+      const variant = await reader.nextResponse(id)
+      assert.deepEqual(
+        variant.result.data.map((thread: any) => thread.id),
+        [childThreadId],
+        `${sourceKind} should discover the subagent child`,
+      )
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

@@ -186,20 +186,24 @@ export class SessionStore {
       parentThreadId?: string | null
       ancestorThreadId?: string | null
       sourceKinds?: string[]
-      sortKey?: 'created_at' | 'updated_at'
+      sortKey?: 'created_at' | 'updated_at' | 'recency_at'
       sortDirection?: 'asc' | 'desc'
     } = {},
   ): ThreadRecord[] {
     const limit = Math.max(1, Math.min(Number(options.limit ?? 50), 200))
     const archived = options.archived === true ? 1 : 0
-    const sortKey = options.sortKey === 'created_at' ? 'created_at' : 'updated_at'
+    const sortKey =
+      options.sortKey === 'updated_at' || options.sortKey === 'recency_at'
+        ? options.sortKey
+        : 'created_at'
+    const sortColumn = sortKey === 'created_at' ? 'created_at' : 'updated_at'
     const sortDirection = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
     const cursor = options.cursor
       ? Number(options.cursor)
       : sortDirection === 'ASC'
         ? -1
         : Number.MAX_SAFE_INTEGER
-    const where = ['t.archived = ?', `t.${sortKey} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
+    const where = ['t.archived = ?', `t.${sortColumn} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
     const args: unknown[] = [archived, cursor]
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
@@ -216,7 +220,11 @@ export class SessionStore {
     if (sourceKinds.length > 0) {
       const predicates = sourceKinds.flatMap((kind) => {
         switch (kind) {
+          case 'subAgent':
+          case 'subAgentReview':
+          case 'subAgentCompact':
           case 'subAgentThreadSpawn':
+          case 'subAgentOther':
             return ["(t.thread_source = 'subagent' AND t.forked_from_id IS NOT NULL)"]
           case 'user':
             return ["t.thread_source = 'user'"]
@@ -239,8 +247,17 @@ export class SessionStore {
     // children, memory-consolidation runs) shouldn't appear in the user's
     // session list. Topology queries are the exception: Codex App asks for
     // subagent descendants without sending our legacy includeEphemeral flag.
+    const hasSubagentSourceFilter = sourceKinds.some((kind) =>
+      [
+        'subAgent',
+        'subAgentReview',
+        'subAgentCompact',
+        'subAgentThreadSpawn',
+        'subAgentOther',
+      ].includes(kind),
+    )
     const topologyQuery =
-      parentThreadId != null || ancestorThreadId != null || sourceKinds.length > 0
+      parentThreadId != null || ancestorThreadId != null || hasSubagentSourceFilter
     if (!options.includeEphemeral && !topologyQuery) where.push('t.ephemeral = 0')
 
     const cwdList = Array.isArray(options.cwd) ? options.cwd : options.cwd ? [options.cwd] : []
@@ -261,7 +278,7 @@ export class SessionStore {
     const queryArgs = ancestorThreadId == null ? args : [ancestorThreadId, ...args]
     const rows = this.db
       .prepare(
-        `${cte} SELECT t.* FROM threads t WHERE ${where.join(' AND ')} ORDER BY t.${sortKey} ${sortDirection}, t.id ${sortDirection} LIMIT ?`,
+        `${cte} SELECT t.* FROM threads t WHERE ${where.join(' AND ')} ORDER BY t.${sortColumn} ${sortDirection}, t.id ${sortDirection} LIMIT ?`,
       )
       .all(...queryArgs, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
