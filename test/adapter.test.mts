@@ -82,6 +82,7 @@ test('server dispatch covers current Codex app-server client method surface', as
     'model/list',
     'modelProvider/capabilities/read',
     'experimentalFeature/list',
+    'permissionProfile/list',
     'experimentalFeature/enablement/set',
     'collaborationMode/list',
     'mock/experimentalMethod',
@@ -144,6 +145,17 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
     assert.equal(init.result.platformFamily, process.platform === 'win32' ? 'windows' : 'unix')
 
     proc.stdin.write(
+      json({ id: 4, method: 'permissionProfile/list', params: { limit: 100, cursor: null } }),
+    )
+    const permissionProfiles = await reader.nextResponse(4)
+    assert.deepEqual(permissionProfiles.result.data, [
+      { id: ':read-only', description: null, allowed: true },
+      { id: ':workspace', description: null, allowed: true },
+      { id: ':danger-full-access', description: null, allowed: true },
+    ])
+    assert.equal(permissionProfiles.result.nextCursor, null)
+
+    proc.stdin.write(
       json({
         id: 2,
         method: 'thread/start',
@@ -153,6 +165,7 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
     const start = await reader.nextResponse(2)
     const threadId = start.result.thread.id
     assert.equal(start.result.modelProvider, 'claude-code')
+    assert.equal(start.result.thread.isPinned, false)
 
     proc.stdin.write(
       json({
@@ -1439,6 +1452,69 @@ test('unix daemon recovers stale in-progress turns after process restart', async
   }
 })
 
+test('stdio app-server recovers stale in-progress turns after process restart', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  try {
+    const reader1 = new JsonLineReader(proc)
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const start = await reader1.nextResponse(1)
+    const threadId = start.result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            {
+              type: 'text',
+              text: `stdio stale restart check ${'x'.repeat(20_000)}`,
+              text_elements: [],
+            },
+          ],
+        },
+      }),
+    )
+    const turnStart = await reader1.nextResponse(2)
+    const turnId = turnStart.result.turn.id
+
+    proc.kill('SIGKILL')
+    await Promise.race([
+      once(proc, 'exit'),
+      delay(2000).then(() => {
+        throw new Error('timed out waiting for killed stdio adapter to exit')
+      }),
+    ])
+
+    proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    const reader2 = new JsonLineReader(proc)
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader2.nextResponse(3)
+    assert.equal(read.result.thread.status.type, 'idle')
+    const recoveredTurn = read.result.thread.turns.find((turn: any) => turn.id === turnId)
+    assert.equal(recoveredTurn.status, 'interrupted')
+    assert.match(recoveredTurn.error.message, /server restarted before completing turn/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
@@ -2486,7 +2562,7 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
   }
 })
 
-test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeline with hidden inner events', async () => {
+test('Task subagent emits the canonical activity lifecycle and leaves wait as the terminal display state', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2494,6 +2570,17 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
   })
   const reader = new JsonLineReader(proc)
   try {
+    proc.stdin.write(
+      json({
+        id: 0,
+        method: 'initialize',
+        params: {
+          clientInfo: { name: 'codex-test-modern', title: 'Codex test', version: 'modern' },
+          capabilities: { subAgentActivityCompleted: true },
+        },
+      }),
+    )
+    await reader.nextResponse(0)
     proc.stdin.write(
       json({
         id: 1,
@@ -2518,12 +2605,17 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     let agentMessageText = ''
     let childThreadStarted: any = null
     let childTurnStarted: any = null
+    let childPromptStarted: any = null
+    let childPromptCompleted: any = null
     let childAgentStarted: any = null
     let childAgentCompleted: any = null
     let childAgentMessageText = ''
     let childTurnCompleted: any = null
     let liveChildRead: any = null
     let leakedInnerItems = 0
+    const subagentActivityStarted = new Map<string, any>()
+    const subagentActivities: any[] = []
+    const parentCompletedOrder: string[] = []
     for (let i = 0; i < 300; i += 1) {
       const message = await reader.next()
       if (message.id === 50) liveChildRead = message.result.thread
@@ -2545,8 +2637,12 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       }
       if (message.method === 'item/started') {
         const item = message.params.item
-        if (message.params.threadId !== threadId && item.type === 'agentMessage') {
+        if (message.params.threadId !== threadId && item.type === 'userMessage') {
+          childPromptStarted = item
+        } else if (message.params.threadId !== threadId && item.type === 'agentMessage') {
           childAgentStarted = item
+        } else if (item.type === 'subAgentActivity') {
+          subagentActivityStarted.set(item.id, item)
         } else if (item.type === 'collabAgentToolCall') {
           const bucket = (collabByTool[item.tool] ??= {})
           bucket.started = item
@@ -2559,11 +2655,17 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       }
       if (message.method === 'item/completed') {
         const item = message.params.item
-        if (message.params.threadId !== threadId && item.type === 'agentMessage') {
+        if (message.params.threadId !== threadId && item.type === 'userMessage') {
+          childPromptCompleted = item
+        } else if (message.params.threadId !== threadId && item.type === 'agentMessage') {
           childAgentCompleted = item
+        } else if (item.type === 'subAgentActivity') {
+          subagentActivities.push(item)
+          parentCompletedOrder.push(`activity:${item.kind}`)
         } else if (item.type === 'collabAgentToolCall') {
           const bucket = (collabByTool[item.tool] ??= {})
           bucket.completed = item
+          parentCompletedOrder.push(`collab:${item.tool}`)
         }
       }
       if (message.method === 'item/agentMessage/delta') {
@@ -2579,9 +2681,10 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       }
     }
 
-    // All three native lifecycle pairs must appear, each with a started AND
-    // a completed for the same id, so Codex App can render the timeline.
-    for (const tool of ['spawnAgent', 'wait', 'closeAgent']) {
+    // Native V2 uses activity items for liveness and leaves wait/completed as
+    // the final parent item. Closing an already-finished child makes older App
+    // reducers discard that completed state and fall back to "started".
+    for (const tool of ['spawnAgent', 'wait']) {
       const lc = collabByTool[tool]
       assert.ok(lc?.started, `expected item/started for ${tool}`)
       assert.ok(lc?.completed, `expected item/completed for ${tool}`)
@@ -2600,6 +2703,33 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       'spawnAgent end should reference exactly one child thread',
     )
     const childThreadId = spawnEnd.receiverThreadIds[0]!
+    assert.deepEqual(
+      subagentActivities.map((item) => item.kind),
+      ['started', 'completed'],
+      'subagent activity must transition from started to completed',
+    )
+    assert.equal(subagentActivities[0].agentThreadId, childThreadId)
+    assert.equal(subagentActivities[1].agentThreadId, childThreadId)
+    assert.equal(subagentActivities[0].agentPath, subagentActivities[1].agentPath)
+    assert.match(subagentActivities[0].agentPath, /^\/root\/[A-Za-z0-9_-]+$/)
+    assert.equal(subagentActivityStarted.size, 2)
+    for (const completedActivity of subagentActivities) {
+      assert.deepEqual(
+        subagentActivityStarted.get(completedActivity.id),
+        completedActivity,
+        `${completedActivity.kind} activity must emit item/started and item/completed with the same id`,
+      )
+    }
+    assert.ok(
+      parentCompletedOrder.indexOf('activity:completed') <
+        parentCompletedOrder.indexOf('collab:wait'),
+      'completed activity must arrive before wait/completed so the bundled App keeps the final done state',
+    )
+    assert.equal(
+      collabByTool.closeAgent,
+      undefined,
+      'a naturally completed child must not receive a synthetic closeAgent lifecycle',
+    )
     assert.ok(childThreadStarted, 'subagent must emit child thread/started for live navigation')
     assert.equal(childThreadStarted.id, childThreadId)
     assert.equal(
@@ -2623,6 +2753,10 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     assert.equal(childTurnStarted.status, 'inProgress')
     assert.equal(childTurnStarted.itemsView, 'notLoaded')
     assert.deepEqual(childTurnStarted.items, [])
+    assert.ok(childPromptStarted, 'subagent prompt must emit child userMessage item/started')
+    assert.ok(childPromptCompleted, 'subagent prompt must emit child userMessage item/completed')
+    assert.equal(childPromptStarted.id, childPromptCompleted.id)
+    assert.equal(childPromptCompleted.content[0].text, 'investigate')
     assert.ok(liveChildRead, 'opening a running subagent must return its child turn')
     assert.equal(liveChildRead.turns.length, 1)
     assert.equal(liveChildRead.turns[0].status, 'inProgress')
@@ -2656,15 +2790,11 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     assert.equal(childTurnCompleted.items[0].type, 'agentMessage')
     assert.equal(childTurnCompleted.items[0].id, childAgentCompleted.id)
     assert.match(childTurnCompleted.items[0].text, /subagent final summary/)
-    // After spawnAgent ends the subagent is now running; only wait/closeAgent
-    // ends report the agent as completed.
+    // After spawnAgent ends the subagent is now running; wait/completed is the
+    // terminal display snapshot after the activity completion event.
     assert.equal(spawnEnd.agentsStates[childThreadId]!.status, 'running')
     assert.equal(collabByTool.wait!.started!.receiverThreadIds[0], childThreadId)
     assert.equal(collabByTool.wait!.completed!.agentsStates[childThreadId]!.status, 'completed')
-    assert.equal(
-      collabByTool.closeAgent!.completed!.agentsStates[childThreadId]!.status,
-      'completed',
-    )
     // collabAgentToolCall.model carries the SDK model the subagent runs on,
     // NOT Claude's subagent_type — the App's "Agent · model" badge depends
     // on this. The mock runs without a subagent_type so the parent's model
@@ -2820,13 +2950,178 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
         `${sourceKind} should not mislabel a thread-spawn child`,
       )
     }
+
+    // Restart the adapter and replay the parent turn from SQLite. The bundled
+    // App reduces items in persisted order, so wait/completed must still be
+    // the last subagent state after a cold restart.
+    const exited = once(proc, 'exit')
+    proc.kill()
+    await exited
+    const restarted = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    const restartedReader = new JsonLineReader(restarted)
+    try {
+      restarted.stdin.write(
+        json({
+          id: 1,
+          method: 'thread/turns/list',
+          params: { threadId, itemsView: 'full' },
+        }),
+      )
+      const persistedTurns = await restartedReader.nextResponse(1)
+      const persistedItems = persistedTurns.result.data[0].items.filter(
+        (item: any) => item.type === 'subAgentActivity' || item.type === 'collabAgentToolCall',
+      )
+      assert.deepEqual(
+        persistedItems.map((item: any) =>
+          item.type === 'subAgentActivity'
+            ? `activity:${item.kind}`
+            : `collab:${item.tool}:${item.status}`,
+        ),
+        [
+          'collab:spawnAgent:completed',
+          'activity:started',
+          'activity:completed',
+          'collab:wait:completed',
+        ],
+      )
+
+      restarted.stdin.write(
+        json({
+          id: 2,
+          method: 'thread/list',
+          params: {
+            parentThreadId: threadId,
+            sourceKinds: ['subAgentThreadSpawn'],
+            sortDirection: 'desc',
+            sortKey: 'created_at',
+            useStateDbOnly: true,
+            limit: 200,
+          },
+        }),
+      )
+      const rediscovered = await restartedReader.nextResponse(2)
+      assert.deepEqual(
+        rediscovered.result.data.map((thread: any) => thread.id),
+        [childThreadId],
+        'a cold App connection must rediscover the persisted subagent child',
+      )
+      assert.equal(rediscovered.result.data[0].status.type, 'idle')
+      assert.equal(rediscovered.result.data[0].isPinned, false)
+
+      restarted.stdin.write(
+        json({
+          id: 3,
+          method: 'thread/read',
+          params: { threadId: childThreadId, includeTurns: true },
+        }),
+      )
+      const coldChild = (await restartedReader.nextResponse(3)).result.thread
+      assert.equal(coldChild.turns.length, 1)
+      assert.equal(coldChild.turns[0].status, 'completed')
+      assert.equal(
+        coldChild.turns[0].items.find((item: any) => item.type === 'userMessage').content[0].text,
+        'investigate',
+      )
+      assert.match(
+        coldChild.turns[0].items.find((item: any) => item.type === 'agentMessage').text,
+        /subagent final summary/,
+      )
+    } finally {
+      restarted.kill()
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('subagent without a terminal result is closed as failed', async () => {
+test('Codex cc 26.818 settles subagents without the unsupported completed activity kind', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 0,
+        method: 'initialize',
+        params: {
+          clientInfo: {
+            name: 'Codex Desktop',
+            title: 'Codex Desktop',
+            version: '26.818.61809',
+          },
+          capabilities: { experimentalApi: true },
+        },
+      }),
+    )
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'subagent check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+
+    const activityKinds: string[] = []
+    let childThreadId = ''
+    let childPromptStarted: any = null
+    let childPromptCompleted: any = null
+    let waitCompleted: any = null
+    let sawCloseAgent = false
+    for (let i = 0; i < 300; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started') {
+        const item = message.params.item
+        if (message.params.threadId !== threadId && item.type === 'userMessage') {
+          childPromptStarted = item
+        }
+        if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent') sawCloseAgent = true
+      }
+      if (message.method === 'item/completed') {
+        const item = message.params.item
+        if (message.params.threadId !== threadId && item.type === 'userMessage') {
+          childPromptCompleted = item
+        }
+        if (item.type === 'subAgentActivity') activityKinds.push(item.kind)
+        if (item.type === 'collabAgentToolCall' && item.tool === 'spawnAgent') {
+          childThreadId = String(item.receiverThreadIds[0] ?? '')
+        }
+        if (item.type === 'collabAgentToolCall' && item.tool === 'wait') waitCompleted = item
+        if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent') sawCloseAgent = true
+      }
+      if (message.method === 'turn/completed' && message.params.threadId === threadId) break
+    }
+
+    assert.deepEqual(activityKinds, ['started'])
+    assert.ok(childPromptStarted)
+    assert.ok(childPromptCompleted)
+    assert.equal(childPromptStarted.id, childPromptCompleted.id)
+    assert.equal(childPromptCompleted.content[0].text, 'investigate')
+    assert.ok(childThreadId)
+    assert.ok(waitCompleted)
+    assert.equal(waitCompleted.status, 'completed')
+    assert.equal(waitCompleted.agentsStates[childThreadId].status, 'completed')
+    assert.equal(sawCloseAgent, false)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('subagent without a terminal result emits interrupted activity and failed wait', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2856,7 +3151,8 @@ test('subagent without a terminal result is closed as failed', async () => {
 
     let childThreadId = ''
     let waitStatus = ''
-    let closeStatus = ''
+    let sawClose = false
+    const activityKinds: string[] = []
     let childTurnCompleted: any = null
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
@@ -2865,8 +3161,8 @@ test('subagent without a terminal result is closed as failed', async () => {
         if (item.type === 'collabAgentToolCall' && item.tool === 'spawnAgent')
           childThreadId = String(item.receiverThreadIds[0] ?? '')
         if (item.type === 'collabAgentToolCall' && item.tool === 'wait') waitStatus = item.status
-        if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent')
-          closeStatus = item.status
+        if (item.type === 'collabAgentToolCall' && item.tool === 'closeAgent') sawClose = true
+        if (item.type === 'subAgentActivity') activityKinds.push(item.kind)
       }
       if (message.method === 'turn/completed' && message.params.threadId !== threadId)
         childTurnCompleted = message.params.turn
@@ -2875,7 +3171,8 @@ test('subagent without a terminal result is closed as failed', async () => {
 
     assert.ok(childThreadId)
     assert.equal(waitStatus, 'failed')
-    assert.equal(closeStatus, 'failed')
+    assert.equal(sawClose, false)
+    assert.deepEqual(activityKinds, ['started', 'interrupted'])
     assert.ok(childTurnCompleted)
     assert.equal(childTurnCompleted.status, 'failed')
     assert.equal(childTurnCompleted.itemsView, 'notLoaded')
@@ -3937,13 +4234,13 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
         )
         assert.equal(completions.length, 1)
         assert.equal(completions[0].params.turn.status, 'interrupted')
-        const closeIndex = messages.findIndex(
+        const interruptedActivityIndex = messages.findIndex(
           (message) =>
             'method' in message &&
             message.method === 'item/completed' &&
             message.params.turnId === turnId &&
-            message.params.item.type === 'collabAgentToolCall' &&
-            message.params.item.tool === 'closeAgent',
+            message.params.item.type === 'subAgentActivity' &&
+            message.params.item.kind === 'interrupted',
         )
         const terminalIndex = messages.findIndex(
           (message) =>
@@ -3951,9 +4248,9 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
             message.method === 'turn/completed' &&
             message.params.turn.id === turnId,
         )
-        assert.ok(closeIndex >= 0)
-        assert.ok(closeIndex < terminalIndex)
-        assert.equal(messages[closeIndex].deliveredTo, 'peer-reconnected')
+        assert.ok(interruptedActivityIndex >= 0)
+        assert.ok(interruptedActivityIndex < terminalIndex)
+        assert.equal(messages[interruptedActivityIndex].deliveredTo, 'peer-reconnected')
         assert.equal(messages[terminalIndex].deliveredTo, 'peer-reconnected')
         assert.equal(
           messages
@@ -3963,8 +4260,7 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
                 message.method === 'item/completed' &&
                 message.params.turnId === turnId &&
                 message.params.item.type === 'collabAgentToolCall' &&
-                (message.params.item.tool === 'wait' ||
-                  message.params.item.tool === 'closeAgent'),
+                message.params.item.tool === 'wait',
             )
             .every((message) => message.deliveredTo === 'peer-reconnected'),
           true,

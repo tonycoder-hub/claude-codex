@@ -61,8 +61,9 @@ and `mock`.
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
 `ultracode:` workflow trigger. Workflow task events are exposed as Codex-native reviewable
 Subagent threads. While a local workflow runs, the adapter tails its journal and projects each
-inner agent as a separate `spawnAgent` → `wait` → `closeAgent` lifecycle; runtimes without journal
-metadata fall back to one aggregate workflow agent when the workflow reaches a terminal state.
+inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
+clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
+fall back to one aggregate workflow agent when the workflow reaches a terminal state.
 A bare `/workflows` lists workflow runs
 recorded in the current Codex thread.
 

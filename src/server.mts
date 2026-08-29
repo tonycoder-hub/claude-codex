@@ -51,6 +51,7 @@ import {
   parseExitCodeFromResult,
   parseSubagentTrailer,
   parseWebSearchAction,
+  permissionProfileList,
   personalityPromptCue,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
@@ -125,6 +126,7 @@ interface SubagentContext {
   childThreadId: string
   childTurnId: string
   waitItemId: string
+  agentPath: string
   prompt: string
   subType: string | null
 }
@@ -134,6 +136,13 @@ interface ActiveSubagentState {
   turn: TurnRecord
   contexts: Map<string, SubagentContext>
   active: Set<string>
+}
+
+interface PeerFeatures {
+  // Codex cc 26.818.61809 only accepts started/interacted/interrupted in the
+  // subAgentActivity schema. Newer clients may opt into the completed kind
+  // explicitly during initialize; keep the legacy wire shape otherwise.
+  supportsCompletedSubagentActivity: boolean
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -147,6 +156,7 @@ export class CodexClaudeAppServer {
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
   >()
   private activePeerByThread = new Map<string, RpcPeer>()
+  private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
@@ -261,6 +271,16 @@ export class CodexClaudeAppServer {
       case 'initialize': {
         const initParams = asRecord(params)
         const clientInfo = asRecord(initParams.clientInfo)
+        const capabilities = asRecord(initParams.capabilities)
+        const declaredActivityKinds = Array.isArray(capabilities.subAgentActivityKinds)
+          ? capabilities.subAgentActivityKinds
+          : []
+        this.peerFeatures.set(peer, {
+          supportsCompletedSubagentActivity:
+            capabilities.subAgentActivityCompleted === true ||
+            declaredActivityKinds.includes('completed') ||
+            process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
+        })
         // Push the account snapshot + MCP server statuses right after handshake
         // so the App's sidebar avatar and MCP panel populate without waiting
         // for the next polling cycle. Without these the avatar stays "signed
@@ -390,6 +410,8 @@ export class CodexClaudeAppServer {
         }
       case 'experimentalFeature/list':
         return { data: [], nextCursor: null }
+      case 'permissionProfile/list':
+        return permissionProfileList(asRecord(params))
       case 'experimentalFeature/enablement/set':
         return { enablement: asRecord(asRecord(params).enablement) }
       case 'collaborationMode/list':
@@ -1538,14 +1560,10 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     const commandOutputSeen = new Set<string>()
-    // Codex's native subagent rendering is a sequence of three
-    // collabAgentToolCall lifecycle pairs in the parent timeline:
-    //   spawnAgent (begin → end)  – "spawning the agent"
-    //   wait        (begin → end)  – the agent is working (covers runtime)
-    //   closeAgent (begin → end)  – the agent finished
-    // Together they tell Codex App which child thread to navigate into and
-    // give the user a live "agent is running" indicator instead of a single
-    // collapsed item that goes silent for the duration of the subagent.
+    // MultiAgent V2 uses subAgentActivity for display/liveness and the
+    // spawnAgent/wait tool calls for the structured timeline. A naturally
+    // completed child is not closed again: wait/completed must remain the last
+    // parent state so Codex App retains the terminal snapshot.
     const subagentContexts = new Map<string, SubagentContext>()
     const activeSubagents = new Set<string>()
     // Track per-item start time so commandExecution / mcpToolCall items can
@@ -1737,9 +1755,8 @@ export class CodexClaudeAppServer {
               return
           }
           if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
-            // Spawn the ephemeral subagent thread, then mirror Codex's native
-            // 3-stage timeline: `spawnAgent` (begin+end), `wait` (begin only,
-            // closes when the Task tool_result lands), and later `closeAgent`.
+            // Spawn the ephemeral child, then mirror MultiAgent V2: a
+            // subAgentActivity started item plus spawnAgent/wait tool state.
             //
             // Concept alignment: Claude's `subagent_type` (e.g. "general-
             // purpose") is the same idea as Codex's `agentRole`; we also
@@ -1755,6 +1772,7 @@ export class CodexClaudeAppServer {
               typeof event.input.model === 'string' ? event.input.model : thread.model
             const childThreadId = newId()
             const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(0, 12)}`
+            const agentPath = `/root/${agentNickname}`
             const agentRole = subType ?? 'general-purpose'
             const childStartedAt = nowSeconds()
             const childThread: ThreadRecord = {
@@ -1820,6 +1838,13 @@ export class CodexClaudeAppServer {
                 turn: this.toLifecycleTurn(childTurn),
               },
             })
+            // The bundled Codex cc client creates a child conversation from
+            // thread/started with an empty turn and treats the history as
+            // loaded while the child is live. Replay the persisted prompt as
+            // a normal item lifecycle so the child page has its Prompt even
+            // when it is opened before the first response token arrives.
+            const childPrompt = childTurn.items.find((item) => item.type === 'userMessage')
+            if (childPrompt) this.emitItemLifecycle(peer, childThreadId, childTurn.id, childPrompt)
             recordRunEvent('subagent.spawned', {
               parentThreadId: thread.id,
               parentTurnId: turn.id,
@@ -1881,11 +1906,20 @@ export class CodexClaudeAppServer {
                 completedAtMs: nowMillis(),
               },
             })
-
-            // Stage 2 — wait (begin only; this is the long phase that gives
-            // Codex App its "agent is working" indicator while the subagent
-            // runs. It closes when the Task tool_result arrives.)
             const waitId = newId()
+            const subagentContext: SubagentContext = {
+              childThreadId,
+              childTurnId: childTurn.id,
+              waitItemId: waitId,
+              agentPath,
+              prompt: promptText,
+              subType,
+            }
+            this.emitSubagentActivity(peer, thread.id, turn.id, subagentContext, 'started')
+
+            // Wait begins after the activity item; this is the long phase that
+            // gives Codex App its "agent is working" indicator while the
+            // subagent runs. It closes when the Task tool_result arrives.
             const waitBegin: ThreadItem = {
               type: 'collabAgentToolCall',
               id: waitId,
@@ -1910,13 +1944,7 @@ export class CodexClaudeAppServer {
             })
 
             itemIds.set(event.toolUseId, waitId)
-            subagentContexts.set(event.toolUseId, {
-              childThreadId,
-              childTurnId: childTurn.id,
-              waitItemId: waitId,
-              prompt: promptText,
-              subType,
-            })
+            subagentContexts.set(event.toolUseId, subagentContext)
             activeSubagents.add(event.toolUseId)
             return
           }
@@ -1965,6 +1993,21 @@ export class CodexClaudeAppServer {
               this.store.upsertThread(childThread)
             }
 
+            // The child completion activity arrives before wait/completed in
+            // native V2. The installed Codex cc schema predates the
+            // `completed` activity kind, so only send it when the client
+            // explicitly advertises support; the wait terminal snapshot is
+            // sufficient for legacy reducers.
+            if (event.isError || this.supportsCompletedSubagentActivity(peer)) {
+              this.emitSubagentActivity(
+                peer,
+                thread.id,
+                turn.id,
+                ctx,
+                event.isError ? 'interrupted' : 'completed',
+              )
+            }
+
             // Push the subagent's token usage as a Codex-native
             // thread/tokenUsage/updated notification on the CHILD thread
             // (App's status bar reads from this) and roll the totals into
@@ -2011,61 +2054,13 @@ export class CodexClaudeAppServer {
               reasoningEffort: null,
               agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
             }
-            this.store.updateItem(turn.id, ctx.waitItemId, () => waitEnd)
+            this.store.updateItemAndMoveToEnd(turn.id, ctx.waitItemId, () => waitEnd)
             this.notify(peer, {
               method: 'item/completed',
               params: {
                 threadId: thread.id,
                 turnId: turn.id,
                 item: waitEnd,
-                completedAtMs: nowMillis(),
-              },
-            })
-
-            // Stage 3 — closeAgent (begin + end emitted together; the SDK has
-            // already torn down the subagent by the time we get the result).
-            const closeId = newId()
-            const closeBegin: ThreadItem = {
-              type: 'collabAgentToolCall',
-              id: closeId,
-              tool: 'closeAgent',
-              status: 'inProgress',
-              senderThreadId: thread.id,
-              receiverThreadIds: [ctx.childThreadId],
-              prompt: null,
-              model: null,
-              reasoningEffort: null,
-              agentsStates: {},
-            }
-            this.store.appendItem(turn.id, closeBegin)
-            this.notify(peer, {
-              method: 'item/started',
-              params: {
-                threadId: thread.id,
-                turnId: turn.id,
-                item: closeBegin,
-                startedAtMs: nowMillis(),
-              },
-            })
-            const closeEnd: ThreadItem = {
-              type: 'collabAgentToolCall',
-              id: closeId,
-              tool: 'closeAgent',
-              status: collabStatus,
-              senderThreadId: thread.id,
-              receiverThreadIds: [ctx.childThreadId],
-              prompt: null,
-              model: null,
-              reasoningEffort: null,
-              agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
-            }
-            this.store.updateItem(turn.id, closeId, () => closeEnd)
-            this.notify(peer, {
-              method: 'item/completed',
-              params: {
-                threadId: thread.id,
-                turnId: turn.id,
-                item: closeEnd,
                 completedAtMs: nowMillis(),
               },
             })
@@ -2607,6 +2602,57 @@ export class CodexClaudeAppServer {
     return completed
   }
 
+  private emitSubagentActivity(
+    peer: RpcPeer,
+    parentThreadId: string,
+    parentTurnId: string,
+    context: SubagentContext,
+    kind: 'started' | 'interacted' | 'interrupted' | 'completed',
+  ): void {
+    const item: ThreadItem = {
+      type: 'subAgentActivity',
+      id: newId(),
+      kind,
+      agentThreadId: context.childThreadId,
+      agentPath: context.agentPath,
+    }
+    this.store.appendItem(parentTurnId, item)
+    this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
+  }
+
+  private emitItemLifecycle(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    item: ThreadItem,
+  ): void {
+    const startedAtMs = nowMillis()
+    this.notify(peer, {
+      method: 'item/started',
+      params: {
+        threadId,
+        turnId,
+        item,
+        startedAtMs,
+      },
+    })
+    this.notify(peer, {
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId,
+        item,
+        completedAtMs: nowMillis(),
+      },
+    })
+  }
+
+  private supportsCompletedSubagentActivity(peer: RpcPeer): boolean {
+    if (process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1') return true
+    if (process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '0') return false
+    return this.peerFeatures.get(peer)?.supportsCompletedSubagentActivity === true
+  }
+
   private finalizeOrphanedSubagents(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -2633,6 +2679,8 @@ export class CodexClaudeAppServer {
         agentRole: context.subType ?? 'general-purpose',
       })
 
+      this.emitSubagentActivity(peer, thread.id, turn.id, context, 'interrupted')
+
       const waitEnd: ThreadItem = {
         type: 'collabAgentToolCall',
         id: context.waitItemId,
@@ -2645,52 +2693,13 @@ export class CodexClaudeAppServer {
         reasoningEffort: null,
         agentsStates: { [context.childThreadId]: { status: 'errored', message } },
       }
-      this.store.updateItem(turn.id, context.waitItemId, () => waitEnd)
+      this.store.updateItemAndMoveToEnd(turn.id, context.waitItemId, () => waitEnd)
       this.notify(peer, {
         method: 'item/completed',
         params: {
           threadId: thread.id,
           turnId: turn.id,
           item: waitEnd,
-          completedAtMs: nowMillis(),
-        },
-      })
-
-      const closeId = newId()
-      const closeBegin: ThreadItem = {
-        type: 'collabAgentToolCall',
-        id: closeId,
-        tool: 'closeAgent',
-        status: 'inProgress',
-        senderThreadId: thread.id,
-        receiverThreadIds: [context.childThreadId],
-        prompt: null,
-        model: null,
-        reasoningEffort: null,
-        agentsStates: {},
-      }
-      this.store.appendItem(turn.id, closeBegin)
-      this.notify(peer, {
-        method: 'item/started',
-        params: {
-          threadId: thread.id,
-          turnId: turn.id,
-          item: closeBegin,
-          startedAtMs: nowMillis(),
-        },
-      })
-      const closeEnd: ThreadItem = {
-        ...closeBegin,
-        status: 'failed',
-        agentsStates: { [context.childThreadId]: { status: 'errored', message } },
-      }
-      this.store.updateItem(turn.id, closeId, () => closeEnd)
-      this.notify(peer, {
-        method: 'item/completed',
-        params: {
-          threadId: thread.id,
-          turnId: turn.id,
-          item: closeEnd,
           completedAtMs: nowMillis(),
         },
       })
@@ -3734,6 +3743,7 @@ export class CodexClaudeAppServer {
       : normalizeSessionSource(thread.source)
     return {
       id: thread.id,
+      isPinned: false,
       sessionId: thread.sessionId,
       forkedFromId: thread.forkedFromId,
       parentThreadId,

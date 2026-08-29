@@ -507,6 +507,27 @@ export function sandboxEnvelope(mode: string | null, cwd: string): unknown {
   }
 }
 
+export function permissionProfileList(params: Record<string, unknown>): unknown {
+  const profiles = [
+    { id: ':read-only', description: null, allowed: true },
+    { id: ':workspace', description: null, allowed: true },
+    { id: ':danger-full-access', description: null, allowed: true },
+  ]
+  const rawCursor = params.cursor
+  const start = rawCursor == null ? 0 : Number(rawCursor)
+  if (!Number.isInteger(start) || start < 0 || start > profiles.length) {
+    throw new Error('invalid permission profile cursor')
+  }
+  const rawLimit = params.limit
+  const requestedLimit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? rawLimit : null
+  const limit = requestedLimit == null ? profiles.length : Math.max(1, Math.floor(requestedLimit))
+  const end = Math.min(profiles.length, start + limit)
+  return {
+    data: profiles.slice(start, end),
+    nextCursor: end < profiles.length ? String(end) : null,
+  }
+}
+
 export function emptyTokenBreakdown(): TokenUsageBreakdown {
   return {
     totalTokens: 0,

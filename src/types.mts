@@ -238,6 +238,16 @@ export type ThreadItem =
         }
       >
     }
+  // Canonical MultiAgent V2 display/liveness item. Codex App discovers the
+  // child from `started` and clears its working state from `completed` or
+  // `interrupted`; collabAgentToolCall remains the structured tool timeline.
+  | {
+      type: 'subAgentActivity'
+      id: string
+      kind: 'started' | 'interacted' | 'interrupted' | 'completed'
+      agentThreadId: string
+      agentPath: string
+    }
   // Codex's native dynamic tool call item — used to surface AskUserQuestion as
   // a structured choice card the App renders inline (paired with the
   // item/tool/requestUserInput reverse RPC). The contentItems array carries

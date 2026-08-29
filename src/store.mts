@@ -389,6 +389,23 @@ export class SessionStore {
     return turn
   }
 
+  updateItemAndMoveToEnd(
+    turnId: string,
+    itemId: string,
+    updater: (item: ThreadItem) => ThreadItem,
+  ): TurnRecord | null {
+    const turn = this.getTurn(turnId)
+    if (!turn) return null
+    const index = turn.items.findIndex((item) => item.id === itemId)
+    if (index < 0) return turn
+    const current = turn.items[index]
+    if (!current) return turn
+    const updated = updater(jsonClone(current))
+    turn.items = [...turn.items.slice(0, index), ...turn.items.slice(index + 1), updated]
+    this.upsertTurn(turn)
+    return turn
+  }
+
   completeTurn(
     turnId: string,
     status: TurnStatus,

@@ -44,7 +44,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. |
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
-| Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits Codex's native 3-stage timeline (`spawnAgent` → `wait` → `closeAgent`); inner events are hidden, the final result lands as one agentMessage on the child thread. |
+| Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
 | Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
