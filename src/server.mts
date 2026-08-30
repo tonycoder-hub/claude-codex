@@ -2895,11 +2895,12 @@ export class CodexClaudeAppServer {
       agentThreadId: context.childThreadId,
       agentPath: context.agentPath,
     }
-    // Codex cc 26.818 rejects `kind: completed` when replaying history. The
-    // live notification is useful to newer clients, but the terminal wait
-    // item and child turn already carry the durable completion state, so keep
-    // the persisted representation legacy-safe.
-    if (kind !== 'completed') this.store.appendItem(parentTurnId, item)
+    // The durable wait/child-turn state is enough while a modern peer is
+    // live. Persist only terminal activity for modern peers; replaying a
+    // persisted `started` marker after a same-process thread/read would make
+    // a completed child look active again. Legacy peers never receive the
+    // successful activity kinds and keep the existing interrupted marker.
+    if (kind !== 'started') this.store.appendItem(parentTurnId, item)
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
   }
 

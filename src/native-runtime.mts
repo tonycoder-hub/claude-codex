@@ -634,6 +634,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         ? `\n<usage>total_tokens: ${usage.totalTokens}\ntool_uses: ${usage.toolUses}\nduration_ms: ${usage.durationMs}</usage>`
         : ''
       const monitor = state.monitor
+      let monitorStopped = false
       if (monitor && !state.aggregateStarted && !state.monitorFailed) {
         await settlesWithin(monitor.flush(), WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS)
         // onError can replace state.monitor while flush() is awaiting I/O.
@@ -648,7 +649,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             state.terminal = true
           }
           await monitor.stop()
+          monitorStopped = true
           const projectedAgentIds = this.workflowProjectedAgentIds(pending, state)
+          // A terminal notification owns this monitor even when the journal
+          // yielded no agents. Clear the state before the aggregate fallback
+          // so a late read or poll cannot keep the parent looking active.
+          if (state.monitor === monitor) state.monitor = null
           if (monitor.startedCount > 0 || projectedAgentIds.length > 0) {
             state.terminal = true
             await this.closeWorkflowAgentLifecycles(
@@ -669,6 +675,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             return
           }
         }
+      }
+      // If monitor failure raced with flush/drain, the error path has already
+      // detached the monitor. Stop the snapshot defensively as well; stop is
+      // idempotent and this closes the only remaining polling handle.
+      if (monitor && !monitorStopped && (state.monitor !== monitor || state.monitorFailed)) {
+        await monitor.stop()
       }
 
       await this.ensureWorkflowAggregateStarted(pending, state)

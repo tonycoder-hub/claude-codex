@@ -1657,6 +1657,7 @@ test('native SDK runtime closes lagged workflow agents using the terminal task s
 test('native SDK runtime bounds terminal workflow monitor flushes', async () => {
   const runtime = new NativeClaudeRuntime()
   const events: any[] = []
+  let stopCalls = 0
   const taskId = 'blocked-flush-workflow-task'
   const pending = {
     activeSubagents: new Set<string>(),
@@ -1674,7 +1675,9 @@ test('native SDK runtime bounds terminal workflow monitor flushes', async () => 
             startedCount: 0,
             flush: async () => await new Promise<void>(() => {}),
             drain: async () => undefined,
-            stop: async () => undefined,
+            stop: async () => {
+              stopCalls += 1
+            },
             activeAgentIds: () => [],
           },
           aggregateStarted: false,
@@ -1700,6 +1703,7 @@ test('native SDK runtime bounds terminal workflow monitor flushes', async () => 
 
   assert.equal(completed, true)
   assert.equal(events.filter((event) => event.toolUseId === `workflow-task:${taskId}`).length, 2)
+  assert.equal(stopCalls, 1, 'terminal fallback must stop its journal monitor before aggregation')
 })
 
 test('native SDK runtime closes projected workflow agents when workflow monitoring stops', async () => {

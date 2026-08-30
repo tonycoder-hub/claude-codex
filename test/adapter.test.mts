@@ -3202,6 +3202,22 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       'the real subagent body must still be there',
     )
 
+    // A same-process late-opened parent must replay a terminal activity, not
+    // the stale started marker that drives the App spinner.
+    proc.stdin.write(
+      json({ id: 8, method: 'thread/turns/list', params: { threadId, itemsView: 'full' } }),
+    )
+    const liveParentTurns = await reader.nextResponse(8)
+    const liveActivityKinds = (liveParentTurns.result.data as any[])
+      .flatMap((turn: any) => turn.items ?? [])
+      .filter((item: any) => item.type === 'subAgentActivity')
+      .map((item: any) => item.kind)
+    assert.deepEqual(
+      liveActivityKinds,
+      ['completed'],
+      'same-process parent history must not retain a started activity marker',
+    )
+
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(
       agentMessageText,
