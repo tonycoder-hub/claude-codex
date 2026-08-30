@@ -12,7 +12,7 @@
 // app or `codex login`). We don't manage tokens for it — just forward what
 // the OS user has.
 
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 import { debugLog, resolveCodexBinary } from './util.mjs'
@@ -20,7 +20,7 @@ import { debugLog, resolveCodexBinary } from './util.mjs'
 interface PendingTurn {
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
-  proc: ChildProcessWithoutNullStreams
+  proc: ChildProcess
   rl: Interface
   resolved: boolean
   resolve: () => void
@@ -69,27 +69,28 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       //   -m <model>                   the model the user picked in the App
       //   -C <cwd>                     anchor the workspace
       //   resume <sessionId>           multi-turn continuity
-      const args: string[] = ['exec', '--json', '--skip-git-repo-check']
-      // Translate Codex sandbox enum from our internal naming.
-      if (context.sandboxMode === 'danger-full-access') {
-        args.push('--dangerously-bypass-approvals-and-sandbox')
-      } else if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
-        args.push('-s', context.sandboxMode)
-      } else {
-        // Default to bypass — App's policy already vetted this turn.
-        args.push('--dangerously-bypass-approvals-and-sandbox')
-      }
-      if (context.model) args.push('-m', context.model)
-      if (context.cwd) args.push('-C', context.cwd)
-      if (context.addDirs && context.addDirs.length > 0) {
-        for (const dir of context.addDirs) args.push('--add-dir', dir)
-      }
-      // Codex's `resume` subcommand expects: `codex exec resume <id> [prompt]`.
-      // The session id is the value we captured as claudeSessionId on the
-      // first turn (server passes it through the same field for codex threads).
       const resumeId = context.claudeSessionId
+      const args: string[] = ['exec']
       if (resumeId) {
-        args.splice(1, 0, 'resume', resumeId)
+        args.push('resume', resumeId, '--json', '--skip-git-repo-check')
+        if (context.sandboxMode === 'danger-full-access' || !context.sandboxMode) {
+          args.push('--dangerously-bypass-approvals-and-sandbox')
+        }
+        if (context.model) args.push('-m', context.model)
+      } else {
+        args.push('--json', '--skip-git-repo-check')
+        if (context.sandboxMode === 'danger-full-access') {
+          args.push('--dangerously-bypass-approvals-and-sandbox')
+        } else if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
+          args.push('-s', context.sandboxMode)
+        } else {
+          args.push('--dangerously-bypass-approvals-and-sandbox')
+        }
+        if (context.model) args.push('-m', context.model)
+        if (context.cwd) args.push('-C', context.cwd)
+        if (context.addDirs && context.addDirs.length > 0) {
+          for (const dir of context.addDirs) args.push('--add-dir', dir)
+        }
       }
       args.push(context.prompt)
 
@@ -101,7 +102,7 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       })
 
       const proc = spawn(binary, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
       })
 
