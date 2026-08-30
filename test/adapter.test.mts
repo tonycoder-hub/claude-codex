@@ -1772,7 +1772,7 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
   }
 })
 
-test('startup recovery preserves successful legacy subagent activity history', async () => {
+test('startup recovery removes legacy activity markers from completed subagent turns', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const store = new SessionStore(join(home, 'state.sqlite'))
   const threadId = randomUUID()
@@ -1794,7 +1794,7 @@ test('startup recovery preserves successful legacy subagent activity history', a
       source: 'appServer',
       createdAt: Math.floor(Date.now() / 1000) - 2,
       updatedAt: Math.floor(Date.now() / 1000) - 2,
-      status: { type: 'idle' },
+      status: { type: 'active', activeFlags: [] },
       approvalPolicy: 'on-request',
       sandboxMode: 'workspace-write',
       ephemeral: false,
@@ -1823,6 +1823,13 @@ test('startup recovery preserves successful legacy subagent activity history', a
           agentPath: '/root/legacy',
         },
         {
+          type: 'subAgentActivity',
+          id: randomUUID(),
+          kind: 'completed',
+          agentThreadId: childThreadId,
+          agentPath: '/root/legacy',
+        },
+        {
           type: 'collabAgentToolCall',
           id: randomUUID(),
           tool: 'wait',
@@ -1839,10 +1846,12 @@ test('startup recovery preserves successful legacy subagent activity history', a
       error: null,
     })
 
-    assert.equal(store.recoverStaleInProgressTurns(), 0)
+    assert.equal(store.recoverStaleInProgressTurns(), 1)
     const recovered = store.getTurn(turnId)
     assert.ok(recovered)
-    assert.equal(recovered.items.find((item) => item.type === 'subAgentActivity')?.kind, 'started')
+    assert.equal(recovered.items.some((item) => item.type === 'subAgentActivity'), false)
+    assert.equal(store.getThread(threadId)?.status.type, 'idle')
+    assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
     store.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3322,7 +3331,8 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
             ? `activity:${item.kind}`
             : `collab:${item.tool}:${item.status}`,
         ),
-        ['collab:spawnAgent:completed', 'activity:started', 'collab:wait:completed'],
+        ['collab:spawnAgent:completed', 'collab:wait:completed'],
+        'cold-open history must not retain a started activity marker after wait/completed',
       )
 
       restarted.stdin.write(
@@ -3442,7 +3452,11 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
       if (message.method === 'turn/completed' && message.params.threadId === threadId) break
     }
 
-    assert.deepEqual(activityKinds, ['started'])
+    assert.deepEqual(
+      activityKinds,
+      [],
+      'Codex cc 26.818 must use spawnAgent/wait lifecycle instead of an unsupported started marker',
+    )
     assert.ok(childPromptStarted)
     assert.ok(childPromptCompleted)
     assert.equal(childPromptStarted.id, childPromptCompleted.id)
@@ -3509,7 +3523,7 @@ test('subagent without a terminal result emits interrupted activity and failed w
     assert.ok(childThreadId)
     assert.equal(waitStatus, 'failed')
     assert.equal(sawClose, false)
-    assert.deepEqual(activityKinds, ['started', 'interrupted'])
+    assert.deepEqual(activityKinds, ['interrupted'])
     assert.ok(childTurnCompleted)
     assert.equal(childTurnCompleted.status, 'failed')
     assert.equal(childTurnCompleted.itemsView, 'notLoaded')
@@ -4704,6 +4718,101 @@ test('subagent watchdog terminalizes a runtime that never returns', async () => 
       assert.ok(child)
       assert.equal(store.listTurns(child.id)[0].status, 'failed')
       assert.equal(store.listTurns(threadId)[0].items.at(-1).status, 'failed')
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('workflow watchdog terminalizes a launch that never publishes a result', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '100'
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const interrupted = []
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'workflow-' + context.turnId,
+            toolName: 'Workflow',
+            input: { command: '/workflows never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+        throw new Error('timed out waiting for workflow watchdog')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: '/workflows hang', text_elements: [] }] },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() =>
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === turnId,
+        ),
+      )
+      const completed = messages.find(
+        (message) =>
+          'method' in message &&
+          message.method === 'turn/completed' &&
+          message.params.turn.id === turnId,
+      )
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+      assert.equal(interrupted.length, 1)
+      assert.equal(
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'item/started' &&
+            message.params.item.type === 'collabAgentToolCall',
+        ),
+        false,
+        'a Workflow launch without projected agents must not fabricate a child card',
+      )
       await server.stop()
     `,
       ],

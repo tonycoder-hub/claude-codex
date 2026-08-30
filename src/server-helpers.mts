@@ -374,6 +374,16 @@ export function permissionProfileIdFromParams(params: Record<string, unknown>): 
   return normalizePermissionProfileId(active.id)
 }
 
+export function hasLegacyPermissionParams(params: Record<string, unknown>): boolean {
+  return (
+    typeof params.approvalPolicy === 'string' ||
+    typeof params.sandbox === 'string' ||
+    (params.sandboxPolicy !== null &&
+      typeof params.sandboxPolicy === 'object' &&
+      !Array.isArray(params.sandboxPolicy))
+  )
+}
+
 export function permissionProfilePolicy(value: unknown): PermissionProfilePolicy | null {
   const id = normalizePermissionProfileId(value)
   if (!id) return null

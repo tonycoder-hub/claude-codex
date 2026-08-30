@@ -57,6 +57,13 @@ export function parseWorkflowLaunchInfo(
 ): WorkflowLaunchInfo | null {
   const launch = recordOrNull(value)
   if (!launch) return null
+  if (launch.taskType == null) launch.taskType = launch.task_type
+  if (launch.taskType == null) launch.taskType = 'local_workflow'
+  if (launch.taskType === 'workflow') launch.taskType = 'local_workflow'
+  if (launch.taskId == null) launch.taskId = launch.task_id
+  if (launch.runId == null) launch.runId = launch.run_id
+  if (launch.transcriptDir == null) launch.transcriptDir = launch.transcript_dir
+  if (launch.workflowName == null) launch.workflowName = launch.workflow_name
   if (String(launch.status ?? '') !== 'async_launched') return null
   if (String(launch.taskType ?? '') !== 'local_workflow') return null
 
@@ -80,7 +87,7 @@ export function parseWorkflowLaunchInfo(
     runId,
     transcriptDir: normalizedTranscriptDir,
     transcriptRoot,
-    workflowName: stringValue(launch.workflowName),
+    workflowName: stringValue(launch.workflowName ?? launch.workflow_name),
     summary: stringValue(launch.summary),
   }
 }

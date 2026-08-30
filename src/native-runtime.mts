@@ -76,6 +76,7 @@ interface PendingTurn {
   structuredBuffer: string
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
   deferredResult: PendingTurnResult | null
+  workflowFailure: string | null
 }
 
 interface PendingTurnResult {
@@ -146,6 +147,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         structuredBuffer: '',
         pendingUserMessage: null,
         deferredResult: null,
+        workflowFailure: null,
       }
       this.turns.set(context.turnId, pending)
       // Kick off the receive loop in the background. We don't await it here
@@ -546,7 +548,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const knownState = pending.workflowTasks?.get(taskId)
       const hasWorkflowHint =
         isWorkflowBackgroundTask(message) || String(message.workflow_name ?? '').trim().length > 0
-      if (!knownState && !hasWorkflowHint) return
+      const sourceToolUseId = String(message.tool_use_id ?? '')
+      const hasPendingWorkflowLaunch = [...(pending.workflowLaunches?.values() ?? [])].some(
+        (launch) => launch.taskId === taskId,
+      )
+      const hasPendingWorkflowTool =
+        sourceToolUseId.length > 0 && pending.workflowToolUseIds?.has(sourceToolUseId) === true
+      // The SDK's task_notification shape does not require task_type or
+      // workflow_name. Once this turn has a matching launch/tool id, the task
+      // is already proven to be a Workflow and the terminal notification must
+      // not be discarded just because optional hints are absent.
+      if (!knownState && !hasWorkflowHint && !hasPendingWorkflowLaunch && !hasPendingWorkflowTool)
+        return
       if (pending.skippedWorkflowTaskIds?.has(taskId)) {
         this.discardDeferredWorkflowLaunches(pending, taskId, '')
         const hiddenState = pending.workflowTasks?.get(taskId)
@@ -576,7 +589,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // projected state from the notification instead of dropping the only
         // terminal signal and leaving the parent deferred forever.
         state = this.ensureWorkflowTask(pending, taskId)
-        const sourceToolUseId = String(message.tool_use_id ?? '')
         if (sourceToolUseId && !state.toolUseId) state.toolUseId = sourceToolUseId
         state.workflowName = String(message.workflow_name ?? '').trim() || state.workflowName
         state.description = String(message.description ?? '').trim() || state.description
@@ -621,33 +633,41 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const trailer = usage
         ? `\n<usage>total_tokens: ${usage.totalTokens}\ntool_uses: ${usage.toolUses}\nduration_ms: ${usage.durationMs}</usage>`
         : ''
-      if (state.monitor && !state.aggregateStarted) {
-        await settlesWithin(state.monitor.flush(), WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS)
-        await state.monitor.drain(WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS)
-        const projectedBeforeStop = this.workflowProjectedAgentIds(pending, state)
-        if (state.monitor.startedCount > 0 || projectedBeforeStop.length > 0) {
-          state.terminal = true
+      const monitor = state.monitor
+      if (monitor && !state.aggregateStarted && !state.monitorFailed) {
+        await settlesWithin(monitor.flush(), WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS)
+        // onError can replace state.monitor while flush() is awaiting I/O.
+        // Continue through the aggregate fallback in that case; never
+        // dereference the mutable field after an await.
+        if (state.monitor === monitor && !state.monitorFailed) {
+          await monitor.drain(WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS)
         }
-        await state.monitor.stop()
-        const projectedAgentIds = this.workflowProjectedAgentIds(pending, state)
-        if (state.monitor.startedCount > 0 || projectedAgentIds.length > 0) {
-          state.terminal = true
-          await this.closeWorkflowAgentLifecycles(
-            pending,
-            state,
-            status === 'completed'
-              ? `Workflow completed before the individual transcript result became visible.\n${summary}`
-              : `Workflow ended before the agent published an individual result.\n${summary}`,
-            status !== 'completed',
-          )
-          pending.completedWorkflowTasks.add(toolUseId)
-          await pending.handlers.onEvent({
-            type: 'notice',
-            level: status === 'completed' ? 'info' : 'warning',
-            message: `${state.workflowName || `Workflow ${taskId}`}: ${summary}${trailer}`,
-          })
-          await this.finishDeferredResult(pending)
-          return
+        if (state.monitor === monitor && !state.monitorFailed) {
+          const projectedBeforeStop = this.workflowProjectedAgentIds(pending, state)
+          if (monitor.startedCount > 0 || projectedBeforeStop.length > 0) {
+            state.terminal = true
+          }
+          await monitor.stop()
+          const projectedAgentIds = this.workflowProjectedAgentIds(pending, state)
+          if (monitor.startedCount > 0 || projectedAgentIds.length > 0) {
+            state.terminal = true
+            await this.closeWorkflowAgentLifecycles(
+              pending,
+              state,
+              status === 'completed'
+                ? `Workflow completed before the individual transcript result became visible.\n${summary}`
+                : `Workflow ended before the agent published an individual result.\n${summary}`,
+              status !== 'completed',
+            )
+            pending.completedWorkflowTasks.add(toolUseId)
+            await pending.handlers.onEvent({
+              type: 'notice',
+              level: status === 'completed' ? 'info' : 'warning',
+              message: `${state.workflowName || `Workflow ${taskId}`}: ${summary}${trailer}`,
+            })
+            await this.finishDeferredResult(pending)
+            return
+          }
         }
       }
 
@@ -916,13 +936,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       },
       onError: async (error) => {
         if (state.terminal) return
-        // Keep the task eligible for the aggregate fallback until Claude sends
-        // its terminal task_notification. This is important for security
-        // failures (for example a symlinked journal): the monitor is dead, but
-        // the task result can still close the visible Agent cleanly.
+        // Monitoring failures are terminal for the projected workflow. Record
+        // the failure now so a later successful SDK result cannot revive the
+        // task or leave the parent waiting for a journal that is no longer
+        // being observed.
+        const message = `Workflow monitoring failed: ${error.message}`
         state.monitorFailed = true
         state.monitor = null
-        const message = `Workflow monitoring failed: ${error.message}`
+        state.terminal = true
+        pending.workflowFailure ??= message
         await this.closeWorkflowAgentLifecycles(pending, state, message, true)
         await this.closeWorkflowAggregateLifecycle(pending, state, message, true)
         if (state.toolUseId) pending.workflowToolUseIds.delete(state.toolUseId)
@@ -932,8 +954,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           message,
         })
         if (pending.deferredResult) {
-          state.terminal = true
           pending.completedWorkflowTasks.add(workflowTaskToolUseId(state.taskId))
+          pending.deferredResult = {
+            ...pending.deferredResult,
+            success: false,
+            resultText: pending.deferredResult.resultText ?? message,
+          }
           await this.finishDeferredResult(pending, true)
         }
       },
@@ -1099,8 +1125,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     if (pending.deferredResult || pending.resolved) return
     const subtype = String(message.subtype ?? '')
-    const success = subtype === 'success' && !message.is_error
-    const resultText = message.result == null ? null : String(message.result)
+    const success = subtype === 'success' && !message.is_error && pending.workflowFailure == null
+    const resultText =
+      pending.workflowFailure ?? (message.result == null ? null : String(message.result))
     const claudeSessionId = message.session_id == null ? null : String(message.session_id)
     const usage = (message.usage as Record<string, unknown>) || {}
     // Push usage + metrics before completed so server can roll them into the

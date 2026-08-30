@@ -32,6 +32,7 @@ import {
   fileChangeFromTool,
   gitDiff,
   gitUntrackedDiff,
+  hasLegacyPermissionParams,
   isGitWorkTree,
   isNotAGitRepo,
   isSubagentToolName,
@@ -130,11 +131,21 @@ const execFileAsync = promisify(execFile)
 const DEFAULT_SUBAGENT_WATCHDOG_MS = 30 * 60 * 1000
 const MIN_SUBAGENT_WATCHDOG_MS = 100
 
+function isWorkflowToolName(value: string): boolean {
+  const name = value.trim().toLowerCase()
+  return name === 'workflow' || name === 'workflows'
+}
+
 function subagentWatchdogTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS?.trim()
   if (!raw) return DEFAULT_SUBAGENT_WATCHDOG_MS
   const parsed = Number(raw)
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0
+  // Zero is the documented opt-out. Invalid and negative values must fall
+  // back to the bounded default rather than silently reintroducing an
+  // unbounded loading state.
+  if (!Number.isFinite(parsed)) return DEFAULT_SUBAGENT_WATCHDOG_MS
+  if (parsed === 0) return 0
+  if (parsed < 0) return DEFAULT_SUBAGENT_WATCHDOG_MS
   return Math.max(MIN_SUBAGENT_WATCHDOG_MS, Math.floor(parsed))
 }
 
@@ -687,6 +698,7 @@ export class CodexClaudeAppServer {
         thread.approvalPolicy = permissionProfile.approvalPolicy
       if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
     } else {
+      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
       if (typeof params.approvalPolicy === 'string')
         thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
       if (typeof params.sandbox === 'string')
@@ -749,7 +761,8 @@ export class CodexClaudeAppServer {
           ? normalizeSandboxMode(params.sandbox)
           : parent.sandboxMode),
       permissionProfileId:
-        permissionProfileIdFromParams(params) ?? parent.permissionProfileId ?? null,
+        permissionProfileIdFromParams(params) ??
+        (hasLegacyPermissionParams(params) ? null : parent.permissionProfileId ?? null),
       ephemeral: parent.ephemeral,
       threadSource:
         typeof params.threadSource === 'string'
@@ -1062,6 +1075,7 @@ export class CodexClaudeAppServer {
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
     if (permissionProfileId) thread.permissionProfileId = permissionProfileId
+    else if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
     if (permissionProfile?.approvalPolicy) thread.approvalPolicy = permissionProfile.approvalPolicy
     if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
     if (typeof params.approvalPolicy === 'string' && !permissionProfile)
@@ -1452,6 +1466,7 @@ export class CodexClaudeAppServer {
         thread.approvalPolicy = permissionProfile.approvalPolicy
       if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
     } else {
+      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
       if (typeof params.approvalPolicy === 'string')
         thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
       const requestedSandbox = sandboxFromTurnParams(params)
@@ -1671,6 +1686,11 @@ export class CodexClaudeAppServer {
     // parent state so Codex App retains the terminal snapshot.
     const subagentContexts = new Map<string, SubagentContext>()
     const activeSubagents = new Set<string>()
+    // A Workflow launch can be pending before it has produced a journal
+    // agent (or after its last projected agent has completed). Keep the
+    // watchdog armed for that whole async operation, not only while a child
+    // tool_use is present.
+    let workflowInFlight = false
     // Track per-item start time so commandExecution / mcpToolCall items can
     // report a real durationMs in turn/completed (otherwise the App's status
     // bar shows "—" for every command).
@@ -1836,7 +1856,12 @@ export class CodexClaudeAppServer {
       watchdogTimer = null
     }
     const armWatchdog = (): void => {
-      if (!watchdogPromise || watchdogTimer || !acceptRuntimeEvents || activeSubagents.size === 0)
+      if (
+        !watchdogPromise ||
+        watchdogTimer ||
+        !acceptRuntimeEvents ||
+        (activeSubagents.size === 0 && !workflowInFlight)
+      )
         return
       watchdogTimer = setTimeout(() => {
         watchdogTimer = null
@@ -2099,8 +2124,6 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
             const ctx = subagentContexts.get(event.toolUseId)
-            activeSubagents.delete(event.toolUseId)
-            subagentContexts.delete(event.toolUseId)
             if (!ctx) return
             const rawResultText = toolResultText(event.content)
             const collabStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
@@ -2213,7 +2236,12 @@ export class CodexClaudeAppServer {
                 completedAtMs: nowMillis(),
               },
             })
-            if (activeSubagents.size === 0) disarmWatchdog()
+            // Keep the context discoverable until the child turn and wait
+            // item have both been persisted. If one of those operations throws,
+            // the outer settlement path can still finalize the child as failed.
+            activeSubagents.delete(event.toolUseId)
+            subagentContexts.delete(event.toolUseId)
+            if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
             return
           }
           if (event.type === 'text_delta') {
@@ -2280,6 +2308,10 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_use') {
+            if (isWorkflowToolName(event.toolName)) {
+              workflowInFlight = true
+              armWatchdog()
+            }
             // Defense in depth against duplicate tool_use events for the same
             // tool_use_id. Claude SDK has been known to emit a block_start
             // event with an empty input AND a complete copy in the final
@@ -2343,6 +2375,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_result') {
+            if (event.toolUseId.startsWith('workflow-task:')) workflowInFlight = false
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
             const resultText = toolResultText(event.content)
@@ -2795,6 +2828,11 @@ export class CodexClaudeAppServer {
     context: SubagentContext,
     kind: 'started' | 'interacted' | 'interrupted' | 'completed',
   ): void {
+    // Codex cc 26.x treats a persisted started activity marker as liveness,
+    // but does not advertise a compatible terminal activity kind. The
+    // canonical spawnAgent/wait lifecycle remains available for discovery and
+    // review, so omit this optional marker for legacy peers.
+    if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return
     const item: ThreadItem = {
       type: 'subAgentActivity',
       id: newId(),

@@ -885,6 +885,45 @@ test('native SDK runtime settles an out-of-order workflow task notification', as
   assert.match(aggregate[1].content, /Workflow completed after reconnect/)
 })
 
+test('native SDK runtime accepts the declared SDK task_notification shape', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = {
+    activeSubagents: new Set<string>(),
+    completedWorkflowTasks: new Set<string>(),
+    // The real SDK notification may omit task_type/workflow_name. The
+    // tool_use_id is the stable correlation key when the Workflow launch is
+    // still pending.
+    workflowToolUseIds: new Set(['sdk-workflow-launch']),
+    workflowLaunches: new Map(),
+    workflowTranscriptRoots: [process.cwd()],
+    workflowTasks: new Map(),
+    skippedWorkflowTaskIds: new Set<string>(),
+    handlers: { onEvent: async (event: unknown) => events.push(event) },
+  }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'task_notification',
+    task_id: 'sdk-shaped-workflow-task',
+    tool_use_id: 'sdk-workflow-launch',
+    status: 'completed',
+    output_file: '/tmp/claude-workflow-output.jsonl',
+    summary: 'SDK-shaped workflow completed',
+    usage: { total_tokens: 12, tool_uses: 1, duration_ms: 20 },
+  })
+
+  const aggregate = events.filter(
+    (event) =>
+      event.toolUseId === 'workflow-task:sdk-shaped-workflow-task' &&
+      (event.type === 'tool_use' || event.type === 'tool_result'),
+  )
+  assert.equal(aggregate.length, 2)
+  assert.equal(aggregate[0].toolName, 'Agent')
+  assert.equal(aggregate[1].isError, false)
+  assert.match(aggregate[1].content, /SDK-shaped workflow completed/)
+})
+
 test('native SDK runtime accepts Workflow launch metadata after the old fallback window', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude-codex-late-workflow-launch-'))
   const runId = 'wf_late_launch_run'
@@ -1323,7 +1362,15 @@ test('native SDK runtime rejects a symlinked workflow journal file', async () =>
     })
     assert.equal(
       events.filter((event) => event.toolUseId === 'workflow-task:journal-symlink-task').length,
-      2,
+      0,
+      'a rejected journal must not be revived as a successful aggregate Agent',
+    )
+    assert.match(String((pending as any).workflowFailure ?? ''), /monitoring failed/i)
+    assert.equal(
+      events.some(
+        (event) => event.type === 'notice' && /monitoring failed/i.test(String(event.message)),
+      ),
+      true,
     )
   } finally {
     await stopWorkflowTasks.call(runtime, pending)
@@ -1404,7 +1451,15 @@ test('native SDK runtime rejects workflow transcript symlinks that escape the tr
     })
     assert.equal(
       events.filter((event) => event.toolUseId === 'workflow-task:trusted-workflow-task').length,
-      2,
+      0,
+      'an escaped transcript must not be revived as a successful aggregate Agent',
+    )
+    assert.match(String((pending as any).workflowFailure ?? ''), /monitoring failed/i)
+    assert.equal(
+      events.some(
+        (event) => event.type === 'notice' && /monitoring failed/i.test(String(event.message)),
+      ),
+      true,
     )
   } finally {
     await stopWorkflowTasks.call(runtime, pending)

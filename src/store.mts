@@ -475,14 +475,15 @@ export class SessionStore {
     const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
     const repairThreadIds = new Set<string>()
     for (const row of terminalRows) {
-      // A successful legacy Codex cc turn intentionally persists only the
-      // `subAgentActivity: started` marker; its completed `wait` item is the
-      // terminal state. Preserve that history, while still clearing activity
-      // markers on genuinely failed/interrupted terminal turns.
+      // A successful legacy Codex cc turn may contain only a
+      // `subAgentActivity: started` marker. Remove that optional marker during
+      // recovery so the canonical spawnAgent/wait terminal state is used and
+      // a cold-opened child cannot be revived as working.
       const itemsJson = this.terminalizeStaleItems(
         row.items_json,
         message,
         row.status !== 'completed',
+        row.status === 'completed',
       )
       if (itemsJson === row.items_json) continue
       updateItems.run(itemsJson, row.id)
@@ -497,6 +498,22 @@ export class SessionStore {
     for (const threadId of repairThreadIds) {
       reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
+    // A crash can land between completeTurn() and the following
+    // setThreadStatus(..., idle). In that window every turn is already
+    // terminal, so the item JSON is unchanged and the repairThreadIds path
+    // above has nothing to trigger. Reconcile those active threads directly;
+    // never touch a thread that still owns an in-progress turn.
+    const reconcileTerminalActiveThreads = this.db.prepare(
+      `UPDATE threads SET status_json = ?, updated_at = ?
+       WHERE json_extract(status_json, '$.type') = 'active'
+         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
+    )
+    const reconciled = reconcileTerminalActiveThreads.run(
+      JSON.stringify({ type: 'idle' }),
+      completedAt,
+      'inProgress',
+    ) as { changes?: number }
+    recoveredCount += Number(reconciled.changes ?? 0)
     return recoveredCount
   }
 
@@ -507,6 +524,7 @@ export class SessionStore {
     itemsJson: string,
     message: string,
     terminalizeActivity = true,
+    stripCompletedActivity = false,
   ): string {
     let parsed: unknown
     try {
@@ -516,45 +534,59 @@ export class SessionStore {
     }
     if (!Array.isArray(parsed)) return '[]'
 
-    const items = parsed.map((raw) => {
-      if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
-      const item = raw as Record<string, unknown>
-      if (
-        terminalizeActivity &&
-        item.type === 'subAgentActivity' &&
-        (item.kind === 'started' || item.kind === 'interacted')
-      ) {
-        return { ...item, kind: 'interrupted' }
-      }
-      if (item.type === 'collabAgentToolCall') {
-        const agentsStates = item.agentsStates
-        const nextStates =
-          agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
-            ? Object.fromEntries(
-                Object.entries(agentsStates as Record<string, unknown>).map(
-                  ([threadId, rawState]) => {
-                    if (rawState == null || typeof rawState !== 'object' || Array.isArray(rawState))
-                      return [threadId, rawState]
-                    const state = rawState as Record<string, unknown>
-                    if (state.status !== 'pendingInit' && state.status !== 'running')
-                      return [threadId, state]
-                    return [
-                      threadId,
-                      { ...state, status: 'errored', message: state.message ?? message },
-                    ]
-                  },
-                ),
-              )
-            : agentsStates
-        return {
-          ...item,
-          ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
-          agentsStates: nextStates,
+    const items = parsed
+      .map((raw) => {
+        if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
+        const item = raw as Record<string, unknown>
+        if (stripCompletedActivity && item.type === 'subAgentActivity') return null
+        if (
+          terminalizeActivity &&
+          item.type === 'subAgentActivity' &&
+          (item.kind === 'started' || item.kind === 'interacted')
+        ) {
+          return { ...item, kind: 'interrupted' }
         }
-      }
-      if (item.status === 'inProgress') return { ...item, status: 'failed' }
-      return item
-    })
+        // Older adapter builds persisted the newer `completed` activity kind,
+        // which Codex cc 26.x cannot deserialize. `interrupted` is the legacy
+        // terminal marker understood by the App reducer and prevents a cold
+        // open from reviving the child as working.
+        if (item.type === 'subAgentActivity' && item.kind === 'completed') {
+          return { ...item, kind: 'interrupted' }
+        }
+        if (item.type === 'collabAgentToolCall') {
+          const agentsStates = item.agentsStates
+          const nextStates =
+            agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
+              ? Object.fromEntries(
+                  Object.entries(agentsStates as Record<string, unknown>).map(
+                    ([threadId, rawState]) => {
+                      if (
+                        rawState == null ||
+                        typeof rawState !== 'object' ||
+                        Array.isArray(rawState)
+                      )
+                        return [threadId, rawState]
+                      const state = rawState as Record<string, unknown>
+                      if (state.status !== 'pendingInit' && state.status !== 'running')
+                        return [threadId, state]
+                      return [
+                        threadId,
+                        { ...state, status: 'errored', message: state.message ?? message },
+                      ]
+                    },
+                  ),
+                )
+              : agentsStates
+          return {
+            ...item,
+            ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
+            agentsStates: nextStates,
+          }
+        }
+        if (item.status === 'inProgress') return { ...item, status: 'failed' }
+        return item
+      })
+      .filter((item) => item != null)
     return JSON.stringify(items)
   }
 
