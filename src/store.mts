@@ -432,8 +432,6 @@ export class SessionStore {
       started_at: number | null
       items_json: string
     }>
-    if (rows.length === 0) return 0
-
     const completedAt = nowSeconds()
     const errorJson = JSON.stringify({ message })
     const updateTurn = this.db.prepare(`
@@ -445,6 +443,7 @@ export class SessionStore {
       'UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?',
     )
     const seenThreads = new Set<string>()
+    let recoveredCount = 0
     for (const row of rows) {
       const startedAt = row.started_at == null ? null : Number(row.started_at)
       const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
@@ -457,11 +456,22 @@ export class SessionStore {
         row.id,
       )
       seenThreads.add(String(row.thread_id))
+      recoveredCount += 1
     }
     for (const threadId of seenThreads) {
       updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
     }
-    return rows.length
+    const terminalRows = this.db
+      .prepare('SELECT id, items_json FROM turns WHERE status <> ?')
+      .all('inProgress') as Array<{ id: string; items_json: string }>
+    const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
+    for (const row of terminalRows) {
+      const itemsJson = this.terminalizeStaleItems(row.items_json, message)
+      if (itemsJson === row.items_json) continue
+      updateItems.run(itemsJson, row.id)
+      recoveredCount += 1
+    }
+    return recoveredCount
   }
 
   // A recovered turn is also replayed from its persisted item list. Clear any
@@ -472,9 +482,9 @@ export class SessionStore {
     try {
       parsed = JSON.parse(itemsJson)
     } catch {
-      return itemsJson
+      return '[]'
     }
-    if (!Array.isArray(parsed)) return itemsJson
+    if (!Array.isArray(parsed)) return '[]'
 
     const items = parsed.map((raw) => {
       if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw

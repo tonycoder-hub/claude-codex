@@ -1624,6 +1624,88 @@ test('startup recovery terminalizes persisted in-progress item liveness', async 
   }
 })
 
+test('startup recovery repairs stale items on already-terminal turns and is idempotent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const store = new SessionStore(join(home, 'state.sqlite'))
+  const threadId = randomUUID()
+  const turnId = randomUUID()
+  try {
+    store.upsertThread({
+      id: threadId,
+      sessionId: threadId,
+      forkedFromId: null,
+      preview: 'terminal item recovery',
+      name: null,
+      archived: false,
+      cwd: process.cwd(),
+      model: 'sonnet',
+      reasoningEffort: null,
+      modelProvider: 'claude-code',
+      claudeSessionId: null,
+      source: 'appServer',
+      createdAt: Math.floor(Date.now() / 1000) - 2,
+      updatedAt: Math.floor(Date.now() / 1000) - 2,
+      status: { type: 'active', activeFlags: [] },
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      ephemeral: false,
+      threadSource: 'user',
+      agentRole: null,
+      agentNickname: null,
+      baseInstructions: null,
+      developerInstructions: null,
+      personality: null,
+      runtimeBackend: 'claude',
+      codexSessionId: null,
+    })
+    store.upsertTurn({
+      id: turnId,
+      threadId,
+      status: 'interrupted',
+      startedAt: Math.floor(Date.now() / 1000) - 2,
+      completedAt: Math.floor(Date.now() / 1000) - 1,
+      durationMs: 1000,
+      items: [
+        {
+          type: 'subAgentActivity',
+          id: randomUUID(),
+          kind: 'started',
+          agentThreadId: randomUUID(),
+          agentPath: '/root/stale',
+        },
+        {
+          type: 'commandExecution',
+          id: randomUUID(),
+          command: 'echo stale',
+          cwd: process.cwd(),
+          processId: null,
+          source: 'shell',
+          status: 'inProgress',
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      ],
+      diff: '',
+      error: { message: 'already interrupted' },
+    })
+
+    assert.equal(store.recoverStaleInProgressTurns(), 1)
+    const recovered = store.getTurn(turnId)
+    assert.ok(recovered)
+    assert.equal(
+      recovered.items.find((item) => item.type === 'subAgentActivity')?.kind,
+      'interrupted',
+    )
+    assert.equal(recovered.items.find((item) => item.type === 'commandExecution')?.status, 'failed')
+    assert.equal(store.recoverStaleInProgressTurns(), 0)
+  } finally {
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
