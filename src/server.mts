@@ -1,3 +1,6 @@
+import { homedir } from 'node:os'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -301,6 +304,7 @@ export class CodexClaudeAppServer {
       case 'thread/goal/clear':
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
+      case 'thread/settings/update':
         return this.threadMetadataUpdate(asRecord(params))
       // Intentional no-ops: Claude Code has no equivalent concept, so the
       // adapter acknowledges the call without side effects rather than failing
@@ -370,6 +374,15 @@ export class CodexClaudeAppServer {
           // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
           // turns it off for environments where the tool is rate-limited.
           webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+        }
+      case 'permissionProfile/list':
+        return {
+          data: [
+            { id: ':read-only', description: null, allowed: true },
+            { id: ':workspace', description: null, allowed: true },
+            { id: ':danger-full-access', description: null, allowed: true },
+          ],
+          nextCursor: null,
         }
       case 'experimentalFeature/list':
         return { data: [], nextCursor: null }
@@ -499,7 +512,7 @@ export class CodexClaudeAppServer {
       case 'process/kill':
         return this.processKill(asRecord(params))
       case 'process/resizePty':
-        return {}
+        return this.processResizePty(asRecord(params))
       case 'externalAgentConfig/detect':
         return { items: [] }
       case 'externalAgentConfig/import':
@@ -534,6 +547,10 @@ export class CodexClaudeAppServer {
     const model = modelFromParams(params, this.configModel)
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
     const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
+    const isTitleOrHelper =
+      params.ephemeral === true ||
+      params.threadSource === 'title_generation' ||
+      params.threadSource === 'memory_consolidation'
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -552,9 +569,9 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
-      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
-      sandboxMode: normalizeSandboxMode(params.sandbox),
-      ephemeral: params.ephemeral === true,
+      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy) ?? 'never',
+      sandboxMode: normalizeSandboxMode(params.sandbox) ?? 'danger-full-access',
+      ephemeral: isTitleOrHelper,
       threadSource: normalizeThreadSource(params.threadSource),
       agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
       agentNickname: nullIfEmpty(
@@ -595,7 +612,8 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    const model = modelFromParams(params, null)
+    const rawModel = modelFromParams(params, null)
+    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
     const reasoningEffort = reasoningEffortFromParams(params, null)
     if (model) {
       // runtimeBackend is pinned at thread/start. Refuse cross-backend
@@ -949,7 +967,32 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+    
+    // Support dynamic model, reasoning effort, approval policy and sandbox updates
+    const rawModel = modelFromParams(params, null)
+    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
+    const reasoningEffort = reasoningEffortFromParams(params, null)
+    if (model) {
+      const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
+      thread.runtimeBackend = newBackend
+      thread.model = model
+    }
+    if (reasoningEffort) thread.reasoningEffort = reasoningEffort
+    if (typeof params.approvalPolicy === 'string')
+      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+    if (typeof params.sandbox === 'string')
+      thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (typeof params.baseInstructions === 'string')
+      thread.baseInstructions = nullIfEmpty(params.baseInstructions)
+    if (typeof params.developerInstructions === 'string')
+      thread.developerInstructions = nullIfEmpty(params.developerInstructions)
+    if (typeof params.personality === 'string')
+      thread.personality = normalizePersonality(params.personality)
+
+    thread.updatedAt = nowSeconds()
+    this.store.upsertThread(thread)
+
+    return this.threadEnvelope(thread, this.store.listTurns(threadId))
   }
 
   private threadRollback(params: Record<string, unknown>): unknown {
@@ -1499,17 +1542,48 @@ export class CodexClaudeAppServer {
     const personality =
       (typeof params.personality === 'string' ? normalizePersonality(params.personality) : null) ??
       thread.personality
-    const systemPromptAddendum = buildSystemPromptAddendum({
-      baseInstructions,
-      developerInstructions,
-      personality,
-    })
+    // If this is a forked side-conversation (sidechat) that has different
+    // developerInstructions from its parent, appending them to systemPromptAddendum
+    // would mutate the system prompt prefix and invalidate the prefix KV cache
+    // for all inherited history (80k+ tokens).
+    // Instead, preserve the parent's system prompt addendum to guarantee 100% cache hits,
+    // and prepend side-conversation instructions directly into the turn's user prompt.
+    let systemPromptAddendum: string | null = null
+    let effectivePrompt = prompt
+    if (thread.forkedFromId != null && developerInstructions) {
+      const parentThread = this.store.getThread(thread.forkedFromId)
+      const parentDev = parentThread?.developerInstructions ?? null
+      if (developerInstructions !== parentDev) {
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions: parentThread?.baseInstructions ?? baseInstructions,
+          developerInstructions: parentDev,
+          personality: parentThread?.personality ?? personality,
+        })
+        effectivePrompt = `<side-conversation-instructions>\n${developerInstructions}\n</side-conversation-instructions>\n\n${prompt}`
+      } else {
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions,
+          developerInstructions,
+          personality,
+        })
+      }
+    } else {
+      systemPromptAddendum = buildSystemPromptAddendum({
+        baseInstructions,
+        developerInstructions,
+        personality,
+      })
+    }
     const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
 
-    const resolvedModel = resolveClaudeModel(
-      stringOr(params.model, thread.model),
-      params.outputSchema == null ? 'normal' : 'summary',
-    )
+    const rawTurnModel = stringOr(params.model, thread.model)
+    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
+    const resolvedModel = isCodexThread
+      ? rawTurnModel
+      : resolveClaudeModel(
+          rawTurnModel,
+          params.outputSchema == null ? 'normal' : 'summary',
+        )
     const resolvedEffort = resolveClaudeEffort(
       typeof params.effort === 'string'
         ? params.effort
@@ -1538,13 +1612,12 @@ export class CodexClaudeAppServer {
     // CodexProxyRuntime consumes it as the resume id. In mock mode the
     // mock runtime handles everything regardless of model id — bypass the
     // codex-proxy override so unit tests stay deterministic.
-    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     await this.runtime.runTurn(
       {
         threadId: thread.id,
         turnId: turn.id,
         purpose: turnPurpose,
-        prompt,
+        prompt: effectivePrompt,
         cwd: stringOr(params.cwd, thread.cwd),
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
@@ -2917,7 +2990,8 @@ export class CodexClaudeAppServer {
     const command = commandArray(params.command)
     if (command.length === 0) throw new Error('process/spawn requires command')
     const cwd = stringOr(params.cwd, process.cwd())
-    const streamOutput = params.streamStdoutStderr === true || params.tty === true
+    const isTty = params.tty === true
+    const streamOutput = params.streamStdoutStderr === true || isTty
     const cap =
       params.outputBytesCap == null ? 1_000_000 : numberOr(params.outputBytesCap, 1_000_000)
     const stdout: Buffer[] = []
@@ -2927,19 +3001,40 @@ export class CodexClaudeAppServer {
     let stdoutCapReached = false
     let stderrCapReached = false
     let exited = false
+
     debugLog('process.spawn.start', {
       processHandle,
       cwd,
       command,
       streamOutput,
       streamStdin: params.streamStdin === true,
-      tty: params.tty === true,
+      tty: isTty,
     })
-    const child = spawn(command[0] as string, command.slice(1), {
-      cwd,
-      env: commandEnv(params.env),
-      stdio: 'pipe',
-    })
+
+    // For interactive TTY sessions (e.g. Codex App built-in terminal), spawn via pty-bridge.py
+    // to allocate a real pseudo-terminal (PTY) master/slave pair with ANSI echo & ZLE line editor.
+    let child: ChildProcess
+    const file = fileURLToPath(import.meta.url)
+    const candidates = [
+      join(file, '../../../scripts/pty-bridge.py'),
+      join(file, '../../scripts/pty-bridge.py'),
+      join(homedir(), '.local/share/claude-codex/scripts/pty-bridge.py'),
+    ]
+    const ptyBridge = candidates.find((c) => c && existsSync(c))
+    if (isTty && ptyBridge && existsSync(ptyBridge)) {
+      child = spawn('python3', [ptyBridge, ...command], {
+        cwd,
+        env: { ...commandEnv(params.env), TERM: 'xterm-256color' },
+        stdio: ['pipe', 'pipe', 'inherit'],
+      })
+      ;(child as any).__isPtyBridge = true
+    } else {
+      child = spawn(command[0] as string, command.slice(1), {
+        cwd,
+        env: commandEnv(params.env),
+        stdio: 'pipe',
+      })
+    }
     this.processHandles.set(processHandle, child)
 
     const capture = (target: Buffer[], chunk: Buffer, currentBytes: number): [number, boolean] => {
@@ -2948,40 +3043,72 @@ export class CodexClaudeAppServer {
       if (allowed > 0) target.push(chunk.subarray(0, allowed))
       return [currentBytes + allowed, allowed < chunk.byteLength]
     }
-    child.stdout?.on('data', (chunk: Buffer | string) => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      if (streamOutput) {
-        this.notify(peer, {
-          method: 'process/outputDelta',
-          params: {
-            processHandle,
-            stream: 'stdout',
-            deltaBase64: buffer.toString('base64'),
-            capReached: false,
-          },
-        })
-      } else {
-        ;[stdoutBytes, stdoutCapReached] = capture(stdout, buffer, stdoutBytes)
-      }
-    })
-    child.stderr?.on('data', (chunk: Buffer | string) => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      if (streamOutput) {
-        this.notify(peer, {
-          method: 'process/outputDelta',
-          params: {
-            processHandle,
-            stream: 'stderr',
-            deltaBase64: buffer.toString('base64'),
-            capReached: false,
-          },
-        })
-      } else {
-        ;[stderrBytes, stderrCapReached] = capture(stderr, buffer, stderrBytes)
-      }
-    })
-    const timeoutMs = params.timeoutMs == null ? 60_000 : numberOr(params.timeoutMs, 60_000)
+
+    if ((child as any).__isPtyBridge) {
+      let bufferStr = ''
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        bufferStr += chunk.toString('utf8')
+        const lines = bufferStr.split(/\r?\n/)
+        bufferStr = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line)
+            if (msg.stream === 'stdout') {
+              this.notify(peer, {
+                method: 'process/outputDelta',
+                params: {
+                  processHandle,
+                  stream: 'stdout',
+                  deltaBase64: msg.delta,
+                  capReached: false,
+                },
+              })
+            }
+          } catch {}
+        }
+      })
+    } else {
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        if (streamOutput) {
+          this.notify(peer, {
+            method: 'process/outputDelta',
+            params: {
+              processHandle,
+              stream: 'stdout',
+              deltaBase64: buffer.toString('base64'),
+              capReached: false,
+            },
+          })
+        } else {
+          ;[stdoutBytes, stdoutCapReached] = capture(stdout, buffer, stdoutBytes)
+        }
+      })
+      child.stderr?.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        if (streamOutput) {
+          this.notify(peer, {
+            method: 'process/outputDelta',
+            params: {
+              processHandle,
+              stream: 'stderr',
+              deltaBase64: buffer.toString('base64'),
+              capReached: false,
+            },
+          })
+        } else {
+          ;[stderrBytes, stderrCapReached] = capture(stderr, buffer, stderrBytes)
+        }
+      })
+    }
+
+    // Do not impose a default timeout on interactive/streaming terminal sessions (tty or streamStdin)
+    const isInteractive = isTty || params.streamStdin === true
+    const defaultTimeout = isInteractive ? 0 : 60_000
+    const timeoutMs = params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
     const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
+
     child.once('error', (error) => {
       debugLog('process.spawn.error', {
         processHandle,
@@ -3006,6 +3133,7 @@ export class CodexClaudeAppServer {
         }),
       )
     })
+
     child.once('close', (code, signal) => {
       if (exited) return
       exited = true
@@ -3039,9 +3167,26 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw new Error(`unknown process handle: ${processHandle}`)
-    if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0)
-      child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
+    if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) {
+      if ((child as any).__isPtyBridge) {
+        child.stdin?.write(JSON.stringify({ action: 'input', data: params.deltaBase64 }) + '\n')
+      } else {
+        child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
+      }
+    }
     if (params.closeStdin === true) child.stdin?.end()
+    return {}
+  }
+
+  private processResizePty(params: Record<string, unknown>): unknown {
+    const processHandle = stringOr(params.processHandle, '')
+    const child = this.processHandles.get(processHandle)
+    if (child && (child as any).__isPtyBridge) {
+      const size = (params.size as Record<string, unknown>) || {}
+      const cols = numberOr(size.cols, 80)
+      const rows = numberOr(size.rows, 24)
+      child.stdin?.write(JSON.stringify({ action: 'resize', cols, rows }) + '\n')
+    }
     return {}
   }
 
@@ -3049,6 +3194,9 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw new Error(`unknown process handle: ${processHandle}`)
+    if ((child as any).__isPtyBridge) {
+      child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
+    }
     child.kill('SIGTERM')
     return {}
   }
@@ -3312,11 +3460,40 @@ export class CodexClaudeAppServer {
         action: { type: 'search', query: q || null, queries: null },
       }
     }
+    let displayTool = event.toolName
+    if (event.toolName === 'Read') {
+      const raw = String(event.input.file_path || event.input.path || '')
+      if (raw) {
+        let displayPath = raw
+        try {
+          if (cwd && raw.startsWith(cwd)) {
+            displayPath = raw.slice(cwd.length).replace(/^\/+/, '')
+          } else {
+            const parts = raw.split(/\//).filter(Boolean)
+            displayPath = parts.length > 2 ? parts.slice(-2).join('/') : raw
+          }
+        } catch {}
+        displayTool = `Read ${displayPath || raw}`
+      }
+    } else if (event.toolName === 'Grep') {
+      const pat = String(event.input.pattern ?? '')
+      const rawPath = event.input.path ? String(event.input.path) : ''
+      let pathStr = ''
+      if (rawPath) {
+        const parts = rawPath.split(/\//).filter(Boolean)
+        pathStr = ` (${parts.length > 2 ? parts.slice(-2).join('/') : rawPath})`
+      }
+      if (pat) displayTool = `Grep ${pat}${pathStr}`
+    } else if (event.toolName === 'Glob') {
+      const pat = String(event.input.pattern ?? '')
+      if (pat) displayTool = `Glob ${pat}`
+    }
+
     return {
       type: 'mcpToolCall',
       id,
       server: 'claude-code',
-      tool: event.toolName,
+      tool: displayTool,
       status: 'inProgress',
       arguments: event.input,
       result: null,
@@ -3326,23 +3503,39 @@ export class CodexClaudeAppServer {
   }
 
   private threadEnvelope(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const sandbox = sandboxEnvelope(thread.sandboxMode, thread.cwd)
+    const profileId =
+      thread.sandboxMode === 'danger-full-access'
+        ? ':danger-full-access'
+        : thread.sandboxMode === 'read-only'
+          ? ':read-only'
+          : ':workspace'
+
     return {
       thread: this.toThread(thread, turns),
       model: thread.model,
       modelProvider: thread.modelProvider,
       serviceTier: null,
       cwd: thread.cwd,
+      runtimeWorkspaceRoots: [thread.cwd],
       instructionSources: [],
-      approvalPolicy: thread.approvalPolicy ?? 'on-request',
+      approvalPolicy: thread.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
-      sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
-      permissionProfile: null,
-      activePermissionProfile: null,
+      sandbox,
+      activePermissionProfile: profileId,
       reasoningEffort: thread.reasoningEffort,
+      multiAgentMode: 'explicitRequestOnly',
     }
   }
 
   private toThread(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const profileId =
+      thread.sandboxMode === 'danger-full-access'
+        ? ':danger-full-access'
+        : thread.sandboxMode === 'read-only'
+          ? ':read-only'
+          : ':workspace'
+
     return {
       id: thread.id,
       sessionId: thread.sessionId,
@@ -3356,6 +3549,8 @@ export class CodexClaudeAppServer {
       path: null,
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
+      canAcceptDirectInput: true,
+      activePermissionProfile: profileId,
       // Defense-in-depth: even if older rows hold an invalid `source` or
       // `threadSource` (legacy `app_server`, empty string from a buggy write
       // path), coerce on the way out so the App's strict deserializer never

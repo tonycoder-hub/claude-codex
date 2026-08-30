@@ -31,6 +31,7 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/get',
     'thread/goal/clear',
     'thread/metadata/update',
+    'thread/settings/update',
     'thread/memoryMode/set',
     'memory/reset',
     'thread/unarchive',
@@ -82,6 +83,7 @@ test('server dispatch covers current Codex app-server client method surface', as
     'model/list',
     'modelProvider/capabilities/read',
     'experimentalFeature/list',
+    'permissionProfile/list',
     'experimentalFeature/enablement/set',
     'collaborationMode/list',
     'mock/experimentalMethod',
@@ -3283,8 +3285,18 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
     proc.stdin.write(json({ id: 5, method: 'mock/experimentalMethod', params: { value: 'ok' } }))
     assert.deepEqual((await reader.nextResponse(5)).result, { echoed: 'ok' })
 
-    proc.stdin.write(json({ id: 6, method: 'windowsSandbox/readiness', params: {} }))
-    assert.deepEqual((await reader.nextResponse(6)).result, { status: 'notConfigured' })
+    proc.stdin.write(json({ id: 6, method: 'permissionProfile/list', params: {} }))
+    assert.deepEqual((await reader.nextResponse(6)).result, {
+      data: [
+        { id: ':read-only', description: null, allowed: true },
+        { id: ':workspace', description: null, allowed: true },
+        { id: ':danger-full-access', description: null, allowed: true },
+      ],
+      nextCursor: null,
+    })
+
+    proc.stdin.write(json({ id: 7, method: 'windowsSandbox/readiness', params: {} }))
+    assert.deepEqual((await reader.nextResponse(7)).result, { status: 'notConfigured' })
 
     proc.stdin.write(json({ id: 7, method: 'plugin/install', params: { pluginName: 'demo' } }))
     assert.deepEqual((await reader.nextResponse(7)).result, {
