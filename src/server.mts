@@ -2250,10 +2250,11 @@ export class CodexClaudeAppServer {
             })
 
             // Codex cc 26.x does not advertise the terminal
-            // subAgentActivity kind and closes its spinner via the legacy
-            // closeAgent lifecycle. Modern peers already have the activity
-            // completion and must not receive a duplicate close.
-            if (!this.supportsCompletedSubagentActivity(peer)) {
+            // subAgentActivity kind. For a successful child, wait/completed
+            // is already the terminal display state; appending closeAgent
+            // makes the bundled client hide the finished child. Keep the
+            // legacy closeAgent cleanup only for failed results.
+            if (!this.supportsCompletedSubagentActivity(peer) && event.isError) {
               const closeId = newId()
               const closeBegin: ThreadItem = {
                 type: 'collabAgentToolCall',

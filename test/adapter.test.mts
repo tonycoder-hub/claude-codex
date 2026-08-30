@@ -3500,8 +3500,8 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
     assert.equal(waitCompleted.agentsStates[childThreadId].status, 'completed')
     assert.equal(
       sawCloseAgent,
-      true,
-      'legacy Codex cc needs closeAgent to clear the child spinner when completed activity is unsupported',
+      false,
+      'successful legacy subagents must keep wait/completed as the visible terminal state',
     )
 
     proc.stdin.write(
