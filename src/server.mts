@@ -867,7 +867,13 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
-    const turns = params.includeTurns === false ? [] : this.store.listTurns(threadId)
+    // Codex cc hydrates the Subagent panel with includeTurns:false. A
+    // parent-linked child with no renderable turns is treated by that client
+    // as still loading, and it does not reliably follow up with turns/list.
+    // Keep metadata-only reads for ordinary threads, but return the small
+    // child transcript so Prompt/Response and the terminal state can render.
+    const includeTurns = params.includeTurns !== false || thread.threadSource === 'subagent'
+    const turns = includeTurns ? this.store.listTurns(threadId) : []
     return { thread: this.toThread(thread, turns) }
   }
 

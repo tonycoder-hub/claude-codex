@@ -2980,7 +2980,9 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
           json({
             id: 50,
             method: 'thread/read',
-            params: { threadId: message.params.threadId, includeTurns: true },
+            // The bundled Codex cc panel uses includeTurns:false while it
+            // opens a child. The adapter must still hydrate this subagent.
+            params: { threadId: message.params.threadId, includeTurns: false },
           }),
         )
       }
@@ -3377,12 +3379,14 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
         json({
           id: 3,
           method: 'thread/read',
-          params: { threadId: childThreadId, includeTurns: true },
+          // Cold-open follows the same metadata-only request as Codex cc.
+          params: { threadId: childThreadId, includeTurns: false },
         }),
       )
       const coldChild = (await restartedReader.nextResponse(3)).result.thread
       assert.equal(coldChild.turns.length, 1)
       assert.equal(coldChild.turns[0].status, 'completed')
+      assert.equal(coldChild.turns[0].itemsView, 'full')
       assert.equal(
         coldChild.turns[0].items.find((item: any) => item.type === 'userMessage').content[0].text,
         'investigate',
@@ -3390,6 +3394,20 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       assert.match(
         coldChild.turns[0].items.find((item: any) => item.type === 'agentMessage').text,
         /subagent final summary/,
+      )
+
+      restarted.stdin.write(
+        json({
+          id: 4,
+          method: 'thread/read',
+          params: { threadId, includeTurns: false },
+        }),
+      )
+      const metadataOnlyParent = (await restartedReader.nextResponse(4)).result.thread
+      assert.equal(
+        metadataOnlyParent.turns.length,
+        0,
+        'ordinary thread/read includeTurns:false must remain metadata-only',
       )
     } finally {
       restarted.kill()
@@ -3483,7 +3501,27 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
     assert.equal(
       sawCloseAgent,
       true,
-      "legacy Codex cc needs closeAgent to clear the child spinner when completed activity is unsupported",
+      'legacy Codex cc needs closeAgent to clear the child spinner when completed activity is unsupported',
+    )
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/read',
+        params: { threadId: childThreadId, includeTurns: false },
+      }),
+    )
+    const legacyChild = (await reader.nextResponse(3)).result.thread
+    assert.equal(legacyChild.turns.length, 1)
+    assert.equal(legacyChild.turns[0].status, 'completed')
+    assert.equal(legacyChild.turns[0].itemsView, 'full')
+    assert.equal(
+      legacyChild.turns[0].items.find((item: any) => item.type === 'userMessage').content[0].text,
+      'investigate',
+    )
+    assert.match(
+      legacyChild.turns[0].items.find((item: any) => item.type === 'agentMessage').text,
+      /subagent final summary/,
     )
   } finally {
     proc.kill()
@@ -3541,7 +3579,11 @@ test('subagent without a terminal result emits interrupted activity and failed w
 
     assert.ok(childThreadId)
     assert.equal(waitStatus, 'failed')
-    assert.equal(sawClose, false)
+    assert.equal(
+      sawClose,
+      true,
+      'legacy Codex cc needs closeAgent to clear an orphaned child spinner',
+    )
     assert.deepEqual(activityKinds, ['interrupted'])
     assert.ok(childTurnCompleted)
     assert.equal(childTurnCompleted.status, 'failed')
