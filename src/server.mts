@@ -252,8 +252,13 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
-    await this.runtime.stop()
+    // Child turns are created directly from Task/Workflow events and are not
+    // registered in activeTurnByThread. Finalize them before aborting the
+    // runtime or closing SQLite, otherwise stdio EOF can leave child turns
+    // persisted as inProgress until a later restart recovery pass.
+    this.finalizeActiveSubagentsForShutdown('server stopped')
     this.completeActiveTurns('interrupted', { message: 'server stopped' })
+    await this.runtime.stop()
     this.store.close()
   }
 
@@ -1691,6 +1696,7 @@ export class CodexClaudeAppServer {
     // watchdog armed for that whole async operation, not only while a child
     // tool_use is present.
     let workflowInFlight = false
+    const workflowLaunchToolUseIds = new Set<string>()
     // Track per-item start time so commandExecution / mcpToolCall items can
     // report a real durationMs in turn/completed (otherwise the App's status
     // bar shows "—" for every command).
@@ -2309,6 +2315,7 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_use') {
             if (isWorkflowToolName(event.toolName)) {
+              workflowLaunchToolUseIds.add(event.toolUseId)
               workflowInFlight = true
               armWatchdog()
             }
@@ -2375,7 +2382,10 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_result') {
-            if (event.toolUseId.startsWith('workflow-task:')) workflowInFlight = false
+            if (workflowLaunchToolUseIds.delete(event.toolUseId)) {
+              workflowInFlight = workflowLaunchToolUseIds.size > 0
+              if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
+            }
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
             const resultText = toolResultText(event.content)
@@ -4114,6 +4124,10 @@ export class CodexClaudeAppServer {
   }
 
   private notify(peer: RpcPeer, notification: { method: string; params: unknown }): void {
+    // Shutdown intentionally suppresses wire notifications: the peer may
+    // already have closed, while persistence still needs to settle child and
+    // parent state without throwing on a broken pipe.
+    if (this.stopped) return
     const target = this.peerForParams(peer, notification.params)
     debugLog('rpc.notify', {
       peerId: target.id,
@@ -4181,6 +4195,30 @@ export class CodexClaudeAppServer {
       this.store.updateThreadStatus(threadId, { type: 'idle' })
     }
     this.activeTurnByThread.clear()
+  }
+
+  private finalizeActiveSubagentsForShutdown(message: string): void {
+    for (const [turnId, state] of this.subagentStateByTurn.entries()) {
+      const turn = this.store.getTurn(turnId)
+      if (!turn || turn.status !== 'inProgress') {
+        this.subagentStateByTurn.delete(turnId)
+        continue
+      }
+      const peer = this.activePeerByThread.get(state.thread.id) ?? {
+        id: 'shutdown',
+        send: () => {},
+        close: () => {},
+      }
+      this.finalizeOrphanedSubagents(
+        peer,
+        state.thread,
+        turn,
+        state.contexts,
+        state.active,
+        message,
+      )
+      this.subagentStateByTurn.delete(turnId)
+    }
   }
 
   private clearActiveTurn(threadId: string): void {

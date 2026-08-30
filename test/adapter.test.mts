@@ -4823,6 +4823,179 @@ test('workflow watchdog terminalizes a launch that never publishes a result', as
   }
 })
 
+test('workflow watchdog disarms when the original Workflow tool result arrives', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '100'
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          const toolUseId = 'workflow-launch-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Workflow',
+            input: { command: '/workflows slow result' },
+          })
+          await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'launch accepted' })
+          await new Promise((resolve) => setTimeout(resolve, 250))
+          await handlers.onEvent({ type: 'completed', success: true, result: 'workflow done' })
+        },
+        async steer() {},
+        async interrupt() {},
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+        throw new Error('timed out waiting for original Workflow result')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: '/workflows slow', text_elements: [] }] },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() =>
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === turnId,
+        ),
+      )
+      const completed = messages.find(
+        (message) =>
+          'method' in message &&
+          message.method === 'turn/completed' &&
+          message.params.turn.id === turnId,
+      )
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('server shutdown terminalizes active child turns before closing the store', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const database = join(home, 'state.sqlite')
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(${JSON.stringify(database)})
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'shutdown-child-' + context.turnId,
+            toolName: 'Task',
+            input: { description: 'child survives shutdown', prompt: 'investigate shutdown' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt() {},
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+        throw new Error('timed out waiting for child creation')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const parentThreadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId: parentThreadId, input: [{ type: 'text', text: 'hang', text_elements: [] }] },
+      })
+      await waitFor(() =>
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'item/completed' &&
+            message.params.item?.tool === 'spawnAgent',
+        ),
+      )
+      await server.stop()
+
+      const reopened = new SessionStore(${JSON.stringify(database)})
+      try {
+        const child = reopened
+          .listThreads({ includeEphemeral: true })
+          .find((candidate) => candidate.threadSource === 'subagent')
+        assert.ok(child)
+        assert.equal(reopened.listTurns(child.id)[0].status, 'failed')
+        assert.equal(reopened.listTurns(parentThreadId)[0].status, 'interrupted')
+        assert.equal(reopened.listTurns(parentThreadId)[0].items.at(-1).status, 'failed')
+        assert.equal(
+          reopened.listThreads({ includeEphemeral: true }).flatMap((thread) => reopened.listTurns(thread.id)).some((turn) => turn.status === 'inProgress'),
+          false,
+        )
+      } finally {
+        reopened.close()
+      }
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const repo = join(home, 'repo')
