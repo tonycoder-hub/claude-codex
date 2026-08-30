@@ -11,6 +11,7 @@ import { Duplex } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
+import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
@@ -1511,6 +1512,114 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
     assert.match(recoveredTurn.error.message, /server restarted before completing turn/)
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('startup recovery terminalizes persisted in-progress item liveness', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const store = new SessionStore(join(home, 'state.sqlite'))
+  const threadId = randomUUID()
+  const childThreadId = randomUUID()
+  const turnId = randomUUID()
+  try {
+    store.upsertThread({
+      id: threadId,
+      sessionId: threadId,
+      forkedFromId: null,
+      preview: 'stale item recovery',
+      name: null,
+      archived: false,
+      cwd: process.cwd(),
+      model: 'sonnet',
+      reasoningEffort: null,
+      modelProvider: 'claude-code',
+      claudeSessionId: null,
+      source: 'appServer',
+      createdAt: Math.floor(Date.now() / 1000) - 2,
+      updatedAt: Math.floor(Date.now() / 1000) - 2,
+      status: { type: 'active', activeFlags: [] },
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      ephemeral: false,
+      threadSource: 'user',
+      agentRole: null,
+      agentNickname: null,
+      baseInstructions: null,
+      developerInstructions: null,
+      personality: null,
+      runtimeBackend: 'claude',
+      codexSessionId: null,
+    })
+    store.upsertTurn({
+      id: turnId,
+      threadId,
+      status: 'inProgress',
+      startedAt: Math.floor(Date.now() / 1000) - 2,
+      completedAt: null,
+      durationMs: null,
+      items: [
+        {
+          type: 'userMessage',
+          id: randomUUID(),
+          content: [{ type: 'text', text: 'stale item recovery', text_elements: [] }],
+        },
+        {
+          type: 'subAgentActivity',
+          id: randomUUID(),
+          kind: 'started',
+          agentThreadId: childThreadId,
+          agentPath: '/root/agent-stale',
+        },
+        {
+          type: 'collabAgentToolCall',
+          id: randomUUID(),
+          tool: 'wait',
+          status: 'inProgress',
+          senderThreadId: threadId,
+          receiverThreadIds: [childThreadId],
+          prompt: null,
+          model: null,
+          reasoningEffort: null,
+          agentsStates: { [childThreadId]: { status: 'running', message: null } },
+        },
+        {
+          type: 'commandExecution',
+          id: randomUUID(),
+          command: 'echo stale',
+          cwd: process.cwd(),
+          processId: null,
+          source: 'shell',
+          status: 'inProgress',
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      ],
+      diff: '',
+      error: null,
+    })
+
+    assert.equal(store.recoverStaleInProgressTurns(), 1)
+    const recovered = store.getTurn(turnId)
+    assert.ok(recovered)
+    assert.equal(recovered.status, 'interrupted')
+    assert.equal(store.getThread(threadId)?.status.type, 'idle')
+    const activity = recovered.items.find((item) => item.type === 'subAgentActivity')
+    assert.equal(activity?.type === 'subAgentActivity' ? activity.kind : null, 'interrupted')
+    const wait = recovered.items.find(
+      (item) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+    )
+    assert.equal(wait?.type === 'collabAgentToolCall' ? wait.status : null, 'failed')
+    assert.equal(
+      wait?.type === 'collabAgentToolCall' ? wait.agentsStates[childThreadId]?.status : null,
+      'errored',
+    )
+    const command = recovered.items.find((item) => item.type === 'commandExecution')
+    assert.equal(command?.type === 'commandExecution' ? command.status : null, 'failed')
+  } finally {
+    store.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

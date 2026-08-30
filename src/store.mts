@@ -425,15 +425,20 @@ export class SessionStore {
 
   recoverStaleInProgressTurns(message = 'server restarted before completing turn'): number {
     const rows = this.db
-      .prepare('SELECT id, thread_id, started_at FROM turns WHERE status = ?')
-      .all('inProgress') as Array<{ id: string; thread_id: string; started_at: number | null }>
+      .prepare('SELECT id, thread_id, started_at, items_json FROM turns WHERE status = ?')
+      .all('inProgress') as Array<{
+      id: string
+      thread_id: string
+      started_at: number | null
+      items_json: string
+    }>
     if (rows.length === 0) return 0
 
     const completedAt = nowSeconds()
     const errorJson = JSON.stringify({ message })
     const updateTurn = this.db.prepare(`
       UPDATE turns
-      SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?
+      SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?, items_json = ?
       WHERE id = ?
     `)
     const updateThread = this.db.prepare(
@@ -443,13 +448,70 @@ export class SessionStore {
     for (const row of rows) {
       const startedAt = row.started_at == null ? null : Number(row.started_at)
       const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
-      updateTurn.run('interrupted', completedAt, durationMs, errorJson, row.id)
+      updateTurn.run(
+        'interrupted',
+        completedAt,
+        durationMs,
+        errorJson,
+        this.terminalizeStaleItems(row.items_json, message),
+        row.id,
+      )
       seenThreads.add(String(row.thread_id))
     }
     for (const threadId of seenThreads) {
       updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
     }
     return rows.length
+  }
+
+  // A recovered turn is also replayed from its persisted item list. Clear any
+  // item-level liveness markers so the App's spinner projection cannot keep a
+  // child agent in `working` after the turn/thread has been terminalized.
+  private terminalizeStaleItems(itemsJson: string, message: string): string {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(itemsJson)
+    } catch {
+      return itemsJson
+    }
+    if (!Array.isArray(parsed)) return itemsJson
+
+    const items = parsed.map((raw) => {
+      if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
+      const item = raw as Record<string, unknown>
+      if (item.type === 'subAgentActivity' && item.kind === 'started') {
+        return { ...item, kind: 'interrupted' }
+      }
+      if (item.type === 'collabAgentToolCall') {
+        const agentsStates = item.agentsStates
+        const nextStates =
+          agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
+            ? Object.fromEntries(
+                Object.entries(agentsStates as Record<string, unknown>).map(
+                  ([threadId, rawState]) => {
+                    if (rawState == null || typeof rawState !== 'object' || Array.isArray(rawState))
+                      return [threadId, rawState]
+                    const state = rawState as Record<string, unknown>
+                    if (state.status !== 'pendingInit' && state.status !== 'running')
+                      return [threadId, state]
+                    return [
+                      threadId,
+                      { ...state, status: 'errored', message: state.message ?? message },
+                    ]
+                  },
+                ),
+              )
+            : agentsStates
+        return {
+          ...item,
+          ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
+          agentsStates: nextStates,
+        }
+      }
+      if (item.status === 'inProgress') return { ...item, status: 'failed' }
+      return item
+    })
+    return JSON.stringify(items)
   }
 
   updateTurnDiff(turnId: string, diff: string): TurnRecord | null {
