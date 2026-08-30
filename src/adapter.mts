@@ -77,13 +77,16 @@ async function main(): Promise<void> {
   }
 
   const store = new SessionStore()
-  if (isUnixDaemon) {
-    const recovered = store.recoverStaleInProgressTurns()
-    if (recovered > 0) {
-      process.stderr.write(
-        `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
-      )
-    }
+  // Codex cc normally launches the app-server over stdio, so a crashed or
+  // force-quit adapter leaves its last turn persisted as `inProgress`. The
+  // next stdio process is the recovery boundary just like the unix daemon;
+  // only recovering unix transports leaves the App's subagent view stuck on
+  // "loading" forever after a restart.
+  const recovered = store.recoverStaleInProgressTurns()
+  if (recovered > 0) {
+    process.stderr.write(
+      `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
+    )
   }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
@@ -106,6 +109,8 @@ async function main(): Promise<void> {
   debugLog('adapter.start', { pid: process.pid, listen, isUnixDaemon })
 
   const onMessage = server.handle.bind(server)
+  const normalized = normalizeListenUrl(listen)
+  const isStdio = normalized === 'stdio://'
 
   // When the Codex client (app-server proxy) disconnects, a `unix://` daemon
   // would otherwise linger forever and keep its Claude runtime sidecar alive.
@@ -151,10 +156,17 @@ async function main(): Promise<void> {
   const onClose = (peer: RpcPeer) => {
     activePeers = Math.max(0, activePeers - 1)
     server.closePeer(peer)
+    if (isStdio) {
+      // A stdio peer is the process lifetime. If Codex closes its pipe during
+      // reconnect, stop the runtime and terminalize all child turns before the
+      // process exits; otherwise the old in-memory subagent can remain active
+      // while the replacement adapter is already serving the same database.
+      void shutdown('stdioClose')
+      return
+    }
     armIdleExit()
   }
 
-  const normalized = normalizeListenUrl(listen)
   if (normalized === 'stdio://') {
     startStdioTransport(onMessage, onClose)
     return

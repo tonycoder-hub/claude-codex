@@ -56,6 +56,27 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
+### `/workflows` compatibility
+
+With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
+`ultracode:` workflow trigger. Workflow task events are exposed as Codex-native reviewable
+Subagent threads. While a local workflow runs, the adapter tails its journal and projects each
+inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
+clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
+fall back to one aggregate workflow agent when the workflow reaches a terminal state.
+A bare `/workflows` lists workflow runs
+recorded in the current Codex thread.
+
+This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
+agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
+management actions such as pause, resume, stop, and save are not implemented.
+
+When Codex Full Access is selected, the adapter keeps Claude in its standard permission mode and
+auto-allows permission requests through the existing Codex bridge. This avoids Relay's refusal of
+dangerous permission bypass outside a recognized container sandbox while preserving a zero-prompt
+Full Access turn. Operators can still opt into native SDK bypass explicitly with
+`CLAUDE_CODEX_PERMISSION_MODE=bypassPermissions` in an appropriately isolated environment.
+
 ## Current release boundaries
 
 - **Production path:** the TypeScript app-server adapter remains the shipping

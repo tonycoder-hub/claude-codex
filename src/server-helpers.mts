@@ -367,6 +367,66 @@ export function normalizeSandboxMode(value: unknown): string | null {
   return v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access' ? v : null
 }
 
+export interface PermissionProfilePolicy {
+  id: string
+  approvalPolicy: string | null
+  sandboxMode: string | null
+}
+
+export function normalizePermissionProfileId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const id = value.trim()
+  return id.length > 0 && id.length <= 128 ? id : null
+}
+
+export function permissionProfileIdFromParams(params: Record<string, unknown>): string | null {
+  const direct = normalizePermissionProfileId(params.permissions)
+  if (direct) return direct
+  const active = asRecord(params.activePermissionProfile)
+  return normalizePermissionProfileId(active.id)
+}
+
+export function hasLegacyPermissionParams(params: Record<string, unknown>): boolean {
+  return (
+    typeof params.approvalPolicy === 'string' ||
+    typeof params.sandbox === 'string' ||
+    (params.sandboxPolicy !== null &&
+      typeof params.sandboxPolicy === 'object' &&
+      !Array.isArray(params.sandboxPolicy))
+  )
+}
+
+export function permissionProfilePolicy(value: unknown): PermissionProfilePolicy | null {
+  const id = normalizePermissionProfileId(value)
+  if (!id) return null
+  switch (id) {
+    case ':read-only':
+      return { id, approvalPolicy: 'on-request', sandboxMode: 'read-only' }
+    case ':workspace':
+      return { id, approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }
+    case ':danger-full-access':
+      return { id, approvalPolicy: 'never', sandboxMode: 'danger-full-access' }
+    default:
+      // Custom profiles are still reported to the App, but their policy is
+      // resolved by the caller's explicit approval/sandbox fields when those
+      // are available. Never silently grant a broader policy for an unknown id.
+      return { id, approvalPolicy: null, sandboxMode: null }
+  }
+}
+
+export function threadPermissionProfileId(
+  permissionProfileId: string | null | undefined,
+  approvalPolicy: string | null,
+  sandboxMode: string | null,
+): string | null {
+  const explicit = normalizePermissionProfileId(permissionProfileId)
+  if (explicit) return explicit
+  if (sandboxMode === 'read-only') return ':read-only'
+  if (sandboxMode === 'danger-full-access') return ':danger-full-access'
+  if (sandboxMode === 'workspace-write' && approvalPolicy === 'on-request') return ':workspace'
+  return null
+}
+
 // turn/start uses `sandboxPolicy: SandboxPolicy` (a struct) instead of the
 // thread/start `sandbox: SandboxMode` string. Translate the struct's `type`
 // back to the internal canonical mode string the sidecar understands.
@@ -507,7 +567,7 @@ export function personalityPromptCue(personality: string | null): string | null 
 // chosen tier. Returning the right shape lets the App render the correct badge
 // (Read-only / Workspace / Full access) and stops it from over-prompting.
 export function sandboxEnvelope(mode: string | null, cwd: string): unknown {
-  if (mode === 'read-only') return { type: 'readOnly' }
+  if (mode === 'read-only') return { type: 'readOnly', networkAccess: false }
   if (mode === 'danger-full-access') return { type: 'dangerFullAccess' }
   // Default: workspace-write (or null/legacy).
   return {
@@ -516,6 +576,27 @@ export function sandboxEnvelope(mode: string | null, cwd: string): unknown {
     networkAccess: true,
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false,
+  }
+}
+
+export function permissionProfileList(params: Record<string, unknown>): unknown {
+  const profiles = [
+    { id: ':read-only', description: null, allowed: true },
+    { id: ':workspace', description: null, allowed: true },
+    { id: ':danger-full-access', description: null, allowed: true },
+  ]
+  const rawCursor = params.cursor
+  const start = rawCursor == null ? 0 : Number(rawCursor)
+  if (!Number.isInteger(start) || start < 0 || start > profiles.length) {
+    throw new Error('invalid permission profile cursor')
+  }
+  const rawLimit = params.limit
+  const requestedLimit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? rawLimit : null
+  const limit = requestedLimit == null ? profiles.length : Math.max(1, Math.floor(requestedLimit))
+  const end = Math.min(profiles.length, start + limit)
+  return {
+    data: profiles.slice(start, end),
+    nextCursor: end < profiles.length ? String(end) : null,
   }
 }
 
