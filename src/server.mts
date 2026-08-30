@@ -2242,6 +2242,51 @@ export class CodexClaudeAppServer {
                 completedAtMs: nowMillis(),
               },
             })
+
+            // Codex cc 26.x does not advertise the terminal
+            // subAgentActivity kind and closes its spinner via the legacy
+            // closeAgent lifecycle. Modern peers already have the activity
+            // completion and must not receive a duplicate close.
+            if (!this.supportsCompletedSubagentActivity(peer)) {
+              const closeId = newId()
+              const closeBegin: ThreadItem = {
+                type: 'collabAgentToolCall',
+                id: closeId,
+                tool: 'closeAgent',
+                status: 'inProgress',
+                senderThreadId: thread.id,
+                receiverThreadIds: [ctx.childThreadId],
+                prompt: null,
+                model: null,
+                reasoningEffort: null,
+                agentsStates: {},
+              }
+              this.store.appendItem(turn.id, closeBegin)
+              this.notify(peer, {
+                method: 'item/started',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  item: closeBegin,
+                  startedAtMs: nowMillis(),
+                },
+              })
+              const closeEnd: ThreadItem = {
+                ...closeBegin,
+                status: collabStatus,
+                agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
+              }
+              this.store.updateItem(turn.id, closeId, () => closeEnd)
+              this.notify(peer, {
+                method: 'item/completed',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  item: closeEnd,
+                  completedAtMs: nowMillis(),
+                },
+              })
+            }
             // Keep the context discoverable until the child turn and wait
             // item have both been persisted. If one of those operations throws,
             // the outer settlement path can still finalize the child as failed.
@@ -2942,6 +2987,46 @@ export class CodexClaudeAppServer {
           completedAtMs: nowMillis(),
         },
       })
+      if (!this.supportsCompletedSubagentActivity(peer)) {
+        const closeId = newId()
+        const closeBegin: ThreadItem = {
+          type: 'collabAgentToolCall',
+          id: closeId,
+          tool: 'closeAgent',
+          status: 'inProgress',
+          senderThreadId: thread.id,
+          receiverThreadIds: [context.childThreadId],
+          prompt: null,
+          model: null,
+          reasoningEffort: null,
+          agentsStates: {},
+        }
+        this.store.appendItem(turn.id, closeBegin)
+        this.notify(peer, {
+          method: 'item/started',
+          params: {
+            threadId: thread.id,
+            turnId: turn.id,
+            item: closeBegin,
+            startedAtMs: nowMillis(),
+          },
+        })
+        const closeEnd: ThreadItem = {
+          ...closeBegin,
+          status: 'failed',
+          agentsStates: { [context.childThreadId]: { status: 'errored', message } },
+        }
+        this.store.updateItem(turn.id, closeId, () => closeEnd)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: {
+            threadId: thread.id,
+            turnId: turn.id,
+            item: closeEnd,
+            completedAtMs: nowMillis(),
+          },
+        })
+      }
     }
   }
 
