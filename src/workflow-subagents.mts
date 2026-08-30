@@ -29,6 +29,7 @@ interface WorkflowJournalMonitorOptions {
   pollIntervalMs?: number
   onStarted: (agent: WorkflowJournalAgentStart) => Promise<void>
   onResult: (agent: WorkflowJournalAgentResult) => Promise<void>
+  onError?: (error: Error) => Promise<void> | void
 }
 
 interface WorkflowJournalEntry {
@@ -89,6 +90,7 @@ export class WorkflowJournalMonitor {
   private readonly pollIntervalMs: number
   private readonly onStarted: WorkflowJournalMonitorOptions['onStarted']
   private readonly onResult: WorkflowJournalMonitorOptions['onResult']
+  private readonly onError: WorkflowJournalMonitorOptions['onError']
   private readonly startedAgentIds = new Set<string>()
   private readonly completedAgentIds = new Set<string>()
   private timer: NodeJS.Timeout | null = null
@@ -103,6 +105,7 @@ export class WorkflowJournalMonitor {
     this.pollIntervalMs = Math.max(10, options.pollIntervalMs ?? 100)
     this.onStarted = options.onStarted
     this.onResult = options.onResult
+    this.onError = options.onError
   }
 
   start(): void {
@@ -119,8 +122,17 @@ export class WorkflowJournalMonitor {
     if (this.pollPromise) return this.pollPromise
     const generation = this.generation
     this.pollPromise = this.pollOnce(generation)
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
         this.fail(error)
+        const failure = this.failure
+        if (failure && this.onError) {
+          // Monitoring runs from an unref'd interval. Never let a failure in
+          // the cleanup callback become an unhandled rejection that leaves the
+          // parent runtime promise pending as well.
+          try {
+            await this.onError(failure)
+          } catch {}
+        }
       })
       .finally(() => {
         this.pollPromise = null

@@ -355,6 +355,56 @@ export function normalizeSandboxMode(value: unknown): string | null {
   return v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access' ? v : null
 }
 
+export interface PermissionProfilePolicy {
+  id: string
+  approvalPolicy: string | null
+  sandboxMode: string | null
+}
+
+export function normalizePermissionProfileId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const id = value.trim()
+  return id.length > 0 && id.length <= 128 ? id : null
+}
+
+export function permissionProfileIdFromParams(params: Record<string, unknown>): string | null {
+  const direct = normalizePermissionProfileId(params.permissions)
+  if (direct) return direct
+  const active = asRecord(params.activePermissionProfile)
+  return normalizePermissionProfileId(active.id)
+}
+
+export function permissionProfilePolicy(value: unknown): PermissionProfilePolicy | null {
+  const id = normalizePermissionProfileId(value)
+  if (!id) return null
+  switch (id) {
+    case ':read-only':
+      return { id, approvalPolicy: 'on-request', sandboxMode: 'read-only' }
+    case ':workspace':
+      return { id, approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }
+    case ':danger-full-access':
+      return { id, approvalPolicy: 'never', sandboxMode: 'danger-full-access' }
+    default:
+      // Custom profiles are still reported to the App, but their policy is
+      // resolved by the caller's explicit approval/sandbox fields when those
+      // are available. Never silently grant a broader policy for an unknown id.
+      return { id, approvalPolicy: null, sandboxMode: null }
+  }
+}
+
+export function threadPermissionProfileId(
+  permissionProfileId: string | null | undefined,
+  approvalPolicy: string | null,
+  sandboxMode: string | null,
+): string | null {
+  const explicit = normalizePermissionProfileId(permissionProfileId)
+  if (explicit) return explicit
+  if (sandboxMode === 'read-only') return ':read-only'
+  if (sandboxMode === 'danger-full-access') return ':danger-full-access'
+  if (sandboxMode === 'workspace-write' && approvalPolicy === 'on-request') return ':workspace'
+  return null
+}
+
 // turn/start uses `sandboxPolicy: SandboxPolicy` (a struct) instead of the
 // thread/start `sandbox: SandboxMode` string. Translate the struct's `type`
 // back to the internal canonical mode string the sidecar understands.
@@ -495,7 +545,7 @@ export function personalityPromptCue(personality: string | null): string | null 
 // chosen tier. Returning the right shape lets the App render the correct badge
 // (Read-only / Workspace / Full access) and stops it from over-prompting.
 export function sandboxEnvelope(mode: string | null, cwd: string): unknown {
-  if (mode === 'read-only') return { type: 'readOnly' }
+  if (mode === 'read-only') return { type: 'readOnly', networkAccess: false }
   if (mode === 'danger-full-access') return { type: 'dangerFullAccess' }
   // Default: workspace-write (or null/legacy).
   return {

@@ -79,6 +79,11 @@ export interface ThreadRecord {
   // permission_mode and the can_use_tool callback.
   approvalPolicy: string | null
   sandboxMode: string | null
+  // Newer Codex clients send a built-in or custom permission profile id
+  // (for example `:danger-full-access`) instead of a legacy sandbox string.
+  // Keep it alongside the normalized policies so the profile survives resume
+  // and the settings UI can round-trip its selection.
+  permissionProfileId?: string | null
   // Codex App marks transient title-generation / consolidation threads as
   // ephemeral — these should not appear in the user-facing thread list.
   ephemeral: boolean

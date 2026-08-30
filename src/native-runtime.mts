@@ -93,6 +93,7 @@ interface WorkflowTaskState {
   monitor: WorkflowJournalMonitor | null
   aggregateStarted: boolean
   terminal: boolean
+  monitorFailed?: boolean
 }
 
 interface PendingPermission {
@@ -138,7 +139,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         completedWorkflowTasks: new Set(),
         workflowToolUseIds: new Set(),
         workflowLaunches: new Map(),
-        workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env),
+        workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
         skippedWorkflowTaskIds: new Set(),
         workflowTasks: new Map(),
         toolStartSeen: new Set(),
@@ -408,7 +409,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (pending.resolved) break
       }
       if (!pending.resolved && pending.deferredResult) {
-        await this.finishDeferredResult(pending)
+        // The SDK iterator is the authoritative lifetime of a turn. If it
+        // closes while a workflow journal still has an unresolved task, there
+        // will be no later task_notification to unblock the deferred result.
+        // Close those projected agents as failed and finish the parent turn
+        // rather than leaving Codex cc's spinner alive forever.
+        if (this.hasPendingWorkflowTasks(pending)) await this.stopWorkflowTasks(pending)
+        await this.finishDeferredResult(pending, true)
         if (!pending.resolved) return
       }
       // The async iterator finished without a 'result' message — treat as
@@ -536,6 +543,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (subtype === 'task_notification') {
       const taskId = String(message.task_id ?? '')
       if (!taskId) return
+      const knownState = pending.workflowTasks?.get(taskId)
+      const hasWorkflowHint =
+        isWorkflowBackgroundTask(message) || String(message.workflow_name ?? '').trim().length > 0
+      if (!knownState && !hasWorkflowHint) return
       if (pending.skippedWorkflowTaskIds?.has(taskId)) {
         this.discardDeferredWorkflowLaunches(pending, taskId, '')
         const hiddenState = pending.workflowTasks?.get(taskId)
@@ -558,8 +569,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await this.finishDeferredResult(pending)
         return
       }
-      const state = pending.workflowTasks?.get(taskId)
-      if (!state) return
+      let state = knownState
+      if (!state) {
+        // Claude can emit task_notification before task_started (especially
+        // after a reconnect or when the SDK batches system events). Create the
+        // projected state from the notification instead of dropping the only
+        // terminal signal and leaving the parent deferred forever.
+        state = this.ensureWorkflowTask(pending, taskId)
+        const sourceToolUseId = String(message.tool_use_id ?? '')
+        if (sourceToolUseId && !state.toolUseId) state.toolUseId = sourceToolUseId
+        state.workflowName = String(message.workflow_name ?? '').trim() || state.workflowName
+        state.description = String(message.description ?? '').trim() || state.description
+        state.prompt =
+          String(message.prompt ?? '').trim() ||
+          state.prompt ||
+          state.description ||
+          state.workflowName
+        this.attachDeferredWorkflowJournal(pending, state, sourceToolUseId)
+      }
       if (message.skip_transcript === true) {
         const skipped =
           pending.skippedWorkflowTaskIds ?? (pending.skippedWorkflowTaskIds = new Set())
@@ -887,6 +914,29 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         pending.activeSubagents.delete(toolUseId)
         pending.completedWorkflowTasks.add(toolUseId)
       },
+      onError: async (error) => {
+        if (state.terminal) return
+        // Keep the task eligible for the aggregate fallback until Claude sends
+        // its terminal task_notification. This is important for security
+        // failures (for example a symlinked journal): the monitor is dead, but
+        // the task result can still close the visible Agent cleanly.
+        state.monitorFailed = true
+        state.monitor = null
+        const message = `Workflow monitoring failed: ${error.message}`
+        await this.closeWorkflowAgentLifecycles(pending, state, message, true)
+        await this.closeWorkflowAggregateLifecycle(pending, state, message, true)
+        if (state.toolUseId) pending.workflowToolUseIds.delete(state.toolUseId)
+        await pending.handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message,
+        })
+        if (pending.deferredResult) {
+          state.terminal = true
+          pending.completedWorkflowTasks.add(workflowTaskToolUseId(state.taskId))
+          await this.finishDeferredResult(pending, true)
+        }
+      },
     })
   }
 
@@ -1018,10 +1068,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return false
   }
 
-  private async finishDeferredResult(pending: PendingTurn): Promise<void> {
+  private async finishDeferredResult(pending: PendingTurn, force = false): Promise<void> {
     const deferred = pending.deferredResult
     if (!deferred || pending.resolved) return
-    if (deferred.success && this.hasPendingWorkflowTasks(pending)) return
+    if (!force && deferred.success && this.hasPendingWorkflowTasks(pending)) return
 
     pending.deferredResult = null
     pending.resolved = true

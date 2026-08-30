@@ -59,6 +59,7 @@ export class SessionStore {
     this.ensureColumn('threads', 'reasoning_effort', 'TEXT')
     this.ensureColumn('threads', 'approval_policy', 'TEXT')
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
+    this.ensureColumn('threads', 'permission_profile_id', 'TEXT')
     this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'thread_source', 'TEXT')
     this.ensureColumn('threads', 'agent_role', 'TEXT')
@@ -112,9 +113,9 @@ export class SessionStore {
         INSERT INTO threads (
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
           model_provider, claude_session_id, source, created_at, updated_at, status_json,
-          approval_policy, sandbox_mode, ephemeral, thread_source, agent_role, agent_nickname,
+          approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -131,6 +132,7 @@ export class SessionStore {
           status_json=excluded.status_json,
           approval_policy=excluded.approval_policy,
           sandbox_mode=excluded.sandbox_mode,
+          permission_profile_id=excluded.permission_profile_id,
           ephemeral=excluded.ephemeral,
           thread_source=excluded.thread_source,
           agent_role=excluded.agent_role,
@@ -159,6 +161,7 @@ export class SessionStore {
         JSON.stringify(thread.status),
         thread.approvalPolicy,
         thread.sandboxMode,
+        thread.permissionProfileId ?? null,
         thread.ephemeral ? 1 : 0,
         thread.threadSource,
         thread.agentRole,
@@ -462,14 +465,37 @@ export class SessionStore {
       updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
     }
     const terminalRows = this.db
-      .prepare('SELECT id, items_json FROM turns WHERE status <> ?')
-      .all('inProgress') as Array<{ id: string; items_json: string }>
+      .prepare('SELECT id, thread_id, status, items_json FROM turns WHERE status <> ?')
+      .all('inProgress') as Array<{
+      id: string
+      thread_id: string
+      status: TurnStatus
+      items_json: string
+    }>
     const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
+    const repairThreadIds = new Set<string>()
     for (const row of terminalRows) {
-      const itemsJson = this.terminalizeStaleItems(row.items_json, message)
+      // A successful legacy Codex cc turn intentionally persists only the
+      // `subAgentActivity: started` marker; its completed `wait` item is the
+      // terminal state. Preserve that history, while still clearing activity
+      // markers on genuinely failed/interrupted terminal turns.
+      const itemsJson = this.terminalizeStaleItems(
+        row.items_json,
+        message,
+        row.status !== 'completed',
+      )
       if (itemsJson === row.items_json) continue
       updateItems.run(itemsJson, row.id)
+      repairThreadIds.add(String(row.thread_id))
       recoveredCount += 1
+    }
+    const reconcileThread = this.db.prepare(
+      `UPDATE threads SET status_json = ?, updated_at = ?
+       WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
+    )
+    for (const threadId of repairThreadIds) {
+      reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
     return recoveredCount
   }
@@ -477,7 +503,11 @@ export class SessionStore {
   // A recovered turn is also replayed from its persisted item list. Clear any
   // item-level liveness markers so the App's spinner projection cannot keep a
   // child agent in `working` after the turn/thread has been terminalized.
-  private terminalizeStaleItems(itemsJson: string, message: string): string {
+  private terminalizeStaleItems(
+    itemsJson: string,
+    message: string,
+    terminalizeActivity = true,
+  ): string {
     let parsed: unknown
     try {
       parsed = JSON.parse(itemsJson)
@@ -489,7 +519,11 @@ export class SessionStore {
     const items = parsed.map((raw) => {
       if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
       const item = raw as Record<string, unknown>
-      if (item.type === 'subAgentActivity' && item.kind === 'started') {
+      if (
+        terminalizeActivity &&
+        item.type === 'subAgentActivity' &&
+        (item.kind === 'started' || item.kind === 'interacted')
+      ) {
         return { ...item, kind: 'interrupted' }
       }
       if (item.type === 'collabAgentToolCall') {
@@ -555,6 +589,8 @@ export class SessionStore {
       status: JSON.parse(String(row.status_json)),
       approvalPolicy: row.approval_policy == null ? null : String(row.approval_policy),
       sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
+      permissionProfileId:
+        row.permission_profile_id == null ? null : String(row.permission_profile_id),
       ephemeral: Number(row.ephemeral ?? 0) === 1,
       threadSource: row.thread_source == null ? null : String(row.thread_source),
       agentRole: row.agent_role == null ? null : String(row.agent_role),

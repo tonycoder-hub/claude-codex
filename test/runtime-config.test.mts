@@ -851,6 +851,40 @@ test('native SDK runtime falls back to aggregate Agent when workflow journal sta
   }
 })
 
+test('native SDK runtime settles an out-of-order workflow task notification', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = {
+    activeSubagents: new Set<string>(),
+    completedWorkflowTasks: new Set<string>(),
+    workflowToolUseIds: new Set<string>(),
+    workflowTranscriptRoots: [process.cwd()],
+    workflowTasks: new Map(),
+    handlers: { onEvent: async (event: unknown) => events.push(event) },
+  }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    // The SDK may batch or reorder these system messages after a reconnect.
+    // There is no preceding task_started marker in this case.
+    subtype: 'task_notification',
+    task_id: 'out-of-order-workflow-task',
+    status: 'completed',
+    workflow_name: 'out-of-order-workflow',
+    summary: 'Workflow completed after reconnect',
+  })
+
+  const aggregate = events.filter(
+    (event) =>
+      event.toolUseId === 'workflow-task:out-of-order-workflow-task' &&
+      (event.type === 'tool_use' || event.type === 'tool_result'),
+  )
+  assert.equal(aggregate.length, 2)
+  assert.equal(aggregate[0].toolName, 'Agent')
+  assert.equal(aggregate[1].isError, false)
+  assert.match(aggregate[1].content, /Workflow completed after reconnect/)
+})
+
 test('native SDK runtime accepts Workflow launch metadata after the old fallback window', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude-codex-late-workflow-launch-'))
   const runId = 'wf_late_launch_run'

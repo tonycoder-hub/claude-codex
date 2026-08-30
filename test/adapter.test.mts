@@ -32,6 +32,7 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/get',
     'thread/goal/clear',
     'thread/metadata/update',
+    'thread/settings/update',
     'thread/memoryMode/set',
     'memory/reset',
     'thread/unarchive',
@@ -189,6 +190,71 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
     }
     assert.match(deltas.join(''), /Claude Code adapter mock response/)
     assert.equal(sawAgentCompleted, true)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('permission profile selection applies full access without legacy sandbox fields', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'codex-test', version: '26.818' }, capabilities: null },
+      }),
+    )
+    await reader.nextResponse(1)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), permissions: ':danger-full-access' },
+      }),
+    )
+    const start = await reader.nextResponse(2)
+    const threadId = start.result.thread.id
+    assert.equal(start.result.approvalPolicy, 'never')
+    assert.equal(start.result.sandbox.type, 'dangerFullAccess')
+    assert.deepEqual(start.result.activePermissionProfile, {
+      id: ':danger-full-access',
+      extends: null,
+    })
+    assert.equal(start.result.permissions, ':danger-full-access')
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }],
+          permissions: ':danger-full-access',
+        },
+      }),
+    )
+    await reader.nextResponse(3)
+    let sawApprovalRequest = false
+    let sawCommandOutput = false
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/commandExecution/requestApproval') sawApprovalRequest = true
+      if (
+        message.method === 'item/commandExecution/outputDelta' &&
+        /mock approval/.test(message.params.delta)
+      )
+        sawCommandOutput = true
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(sawApprovalRequest, false)
+    assert.equal(sawCommandOutput, true)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1706,6 +1772,83 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
   }
 })
 
+test('startup recovery preserves successful legacy subagent activity history', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const store = new SessionStore(join(home, 'state.sqlite'))
+  const threadId = randomUUID()
+  const turnId = randomUUID()
+  const childThreadId = randomUUID()
+  try {
+    store.upsertThread({
+      id: threadId,
+      sessionId: threadId,
+      forkedFromId: null,
+      preview: 'legacy activity history',
+      name: null,
+      archived: false,
+      cwd: process.cwd(),
+      model: 'sonnet',
+      reasoningEffort: null,
+      modelProvider: 'claude-code',
+      claudeSessionId: null,
+      source: 'appServer',
+      createdAt: Math.floor(Date.now() / 1000) - 2,
+      updatedAt: Math.floor(Date.now() / 1000) - 2,
+      status: { type: 'idle' },
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      ephemeral: false,
+      threadSource: 'user',
+      agentRole: null,
+      agentNickname: null,
+      baseInstructions: null,
+      developerInstructions: null,
+      personality: null,
+      runtimeBackend: 'claude',
+      codexSessionId: null,
+    })
+    store.upsertTurn({
+      id: turnId,
+      threadId,
+      status: 'completed',
+      startedAt: Math.floor(Date.now() / 1000) - 2,
+      completedAt: Math.floor(Date.now() / 1000) - 1,
+      durationMs: 1000,
+      items: [
+        {
+          type: 'subAgentActivity',
+          id: randomUUID(),
+          kind: 'started',
+          agentThreadId: childThreadId,
+          agentPath: '/root/legacy',
+        },
+        {
+          type: 'collabAgentToolCall',
+          id: randomUUID(),
+          tool: 'wait',
+          status: 'completed',
+          senderThreadId: threadId,
+          receiverThreadIds: [childThreadId],
+          prompt: null,
+          model: null,
+          reasoningEffort: null,
+          agentsStates: { [childThreadId]: { status: 'completed', message: null } },
+        },
+      ],
+      diff: '',
+      error: null,
+    })
+
+    assert.equal(store.recoverStaleInProgressTurns(), 0)
+    const recovered = store.getTurn(turnId)
+    assert.ok(recovered)
+    assert.equal(recovered.items.find((item) => item.type === 'subAgentActivity')?.kind, 'started')
+  } finally {
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
@@ -2757,7 +2900,13 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_SUBAGENT_COMPLETED: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   const reader = new JsonLineReader(proc)
   try {
@@ -3144,7 +3293,9 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
 
     // Restart the adapter and replay the parent turn from SQLite. The bundled
     // App reduces items in persisted order, so wait/completed must still be
-    // the last subagent state after a cold restart.
+    // the last subagent state after a cold restart. `completed` activity is a
+    // live-only extension; the durable history stays compatible with Codex cc
+    // 26.818, whose schema only accepts started/interacted/interrupted.
     const exited = once(proc, 'exit')
     proc.kill()
     await exited
@@ -3171,12 +3322,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
             ? `activity:${item.kind}`
             : `collab:${item.tool}:${item.status}`,
         ),
-        [
-          'collab:spawnAgent:completed',
-          'activity:started',
-          'activity:completed',
-          'collab:wait:completed',
-        ],
+        ['collab:spawnAgent:completed', 'activity:started', 'collab:wait:completed'],
       )
 
       restarted.stdin.write(
@@ -4466,6 +4612,98 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
           false,
         )
       }
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('subagent watchdog terminalizes a runtime that never returns', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '100'
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const interrupted = []
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'stuck-' + context.turnId,
+            toolName: 'Task',
+            input: { description: 'stuck subagent', prompt: 'never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+        throw new Error('timed out waiting for watchdog')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hang', text_elements: [] }] },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() =>
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === turnId,
+        ),
+      )
+
+      const completed = messages.find(
+        (message) =>
+          'method' in message &&
+          message.method === 'turn/completed' &&
+          message.params.turn.id === turnId,
+      )
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+      assert.equal(interrupted.length, 1)
+      const child = store
+        .listThreads({ includeEphemeral: true })
+        .find((candidate) => candidate.threadSource === 'subagent')
+      assert.ok(child)
+      assert.equal(store.listTurns(child.id)[0].status, 'failed')
+      assert.equal(store.listTurns(threadId)[0].items.at(-1).status, 'failed')
       await server.stop()
     `,
       ],

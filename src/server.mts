@@ -51,7 +51,9 @@ import {
   parseExitCodeFromResult,
   parseSubagentTrailer,
   parseWebSearchAction,
+  permissionProfileIdFromParams,
   permissionProfileList,
+  permissionProfilePolicy,
   personalityPromptCue,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
@@ -64,6 +66,7 @@ import {
   stringOr,
   summarizeInjectedItem,
   summarizeRpcParams,
+  threadPermissionProfileId,
   todoWriteToPlanSteps,
   tokenBreakdownFromClaudeUsage,
   toolResultText,
@@ -119,6 +122,21 @@ import { parseWorkflowCommand } from './workflow-command.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
+
+// A missing Claude Task result must not keep Codex cc in its working state
+// forever. This is deliberately a long, configurable watchdog for the whole
+// subagent phase; it is not the short journal-drain grace period used when a
+// terminal notification has already arrived.
+const DEFAULT_SUBAGENT_WATCHDOG_MS = 30 * 60 * 1000
+const MIN_SUBAGENT_WATCHDOG_MS = 100
+
+function subagentWatchdogTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS?.trim()
+  if (!raw) return DEFAULT_SUBAGENT_WATCHDOG_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0
+  return Math.max(MIN_SUBAGENT_WATCHDOG_MS, Math.floor(parsed))
+}
 
 type TurnItemsView = 'full' | 'summary' | 'notLoaded'
 
@@ -339,6 +357,8 @@ export class CodexClaudeAppServer {
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
         return this.threadMetadataUpdate(asRecord(params))
+      case 'thread/settings/update':
+        return this.threadSettingsUpdate(peer, asRecord(params))
       // Intentional no-ops: Claude Code has no equivalent concept, so the
       // adapter acknowledges the call without side effects rather than failing
       // the RPC (which would break the Codex App connection).
@@ -572,6 +592,8 @@ export class CodexClaudeAppServer {
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const model = modelFromParams(params, this.configModel)
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
+    const permissionProfileId = permissionProfileIdFromParams(params)
+    const permissionProfile = permissionProfilePolicy(permissionProfileId)
     const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
     const thread: ThreadRecord = {
       id,
@@ -591,8 +613,10 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
-      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
-      sandboxMode: normalizeSandboxMode(params.sandbox),
+      approvalPolicy:
+        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy),
+      sandboxMode: permissionProfile?.sandboxMode ?? normalizeSandboxMode(params.sandbox),
+      permissionProfileId: permissionProfile?.id ?? null,
       ephemeral: params.ephemeral === true,
       threadSource: normalizeThreadSource(params.threadSource),
       agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
@@ -636,6 +660,8 @@ export class CodexClaudeAppServer {
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, null)
     const reasoningEffort = reasoningEffortFromParams(params, null)
+    const permissionProfileId = permissionProfileIdFromParams(params)
+    const permissionProfile = permissionProfilePolicy(permissionProfileId)
     if (model) {
       // runtimeBackend is pinned at thread/start. Refuse cross-backend
       // model changes on resume — the conversation history wouldn't carry
@@ -655,10 +681,17 @@ export class CodexClaudeAppServer {
       }
     }
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
-    if (typeof params.approvalPolicy === 'string')
-      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-    if (typeof params.sandbox === 'string')
-      thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (permissionProfileId) {
+      thread.permissionProfileId = permissionProfileId
+      if (permissionProfile?.approvalPolicy)
+        thread.approvalPolicy = permissionProfile.approvalPolicy
+      if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
+    } else {
+      if (typeof params.approvalPolicy === 'string')
+        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+      if (typeof params.sandbox === 'string')
+        thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    }
     if (typeof params.threadSource === 'string')
       thread.threadSource = normalizeThreadSource(params.threadSource)
     if (typeof params.baseInstructions === 'string')
@@ -677,6 +710,7 @@ export class CodexClaudeAppServer {
       ephemeral: thread.ephemeral,
     })
     this.activePeerByThread.set(threadId, peer)
+    this.bindPeerToDescendants(peer, threadId)
     return this.threadEnvelope(
       thread,
       params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
@@ -705,13 +739,17 @@ export class CodexClaudeAppServer {
       updatedAt: now,
       status: { type: 'idle' },
       approvalPolicy:
-        typeof params.approvalPolicy === 'string'
+        permissionProfilePolicy(permissionProfileIdFromParams(params))?.approvalPolicy ??
+        (typeof params.approvalPolicy === 'string'
           ? normalizeApprovalPolicy(params.approvalPolicy)
-          : parent.approvalPolicy,
+          : parent.approvalPolicy),
       sandboxMode:
-        typeof params.sandbox === 'string'
+        permissionProfilePolicy(permissionProfileIdFromParams(params))?.sandboxMode ??
+        (typeof params.sandbox === 'string'
           ? normalizeSandboxMode(params.sandbox)
-          : parent.sandboxMode,
+          : parent.sandboxMode),
+      permissionProfileId:
+        permissionProfileIdFromParams(params) ?? parent.permissionProfileId ?? null,
       ephemeral: parent.ephemeral,
       threadSource:
         typeof params.threadSource === 'string'
@@ -1014,6 +1052,60 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
     return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+  }
+
+  private threadSettingsUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+
+    const permissionProfileId = permissionProfileIdFromParams(params)
+    const permissionProfile = permissionProfilePolicy(permissionProfileId)
+    if (permissionProfileId) thread.permissionProfileId = permissionProfileId
+    if (permissionProfile?.approvalPolicy) thread.approvalPolicy = permissionProfile.approvalPolicy
+    if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
+    if (typeof params.approvalPolicy === 'string' && !permissionProfile)
+      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+    const sandboxMode = sandboxFromTurnParams(params)
+    if (sandboxMode && !permissionProfile) thread.sandboxMode = sandboxMode
+    if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
+    this.store.upsertThread(thread)
+
+    const activePermissionProfileId = threadPermissionProfileId(
+      thread.permissionProfileId,
+      thread.approvalPolicy,
+      thread.sandboxMode,
+    )
+    this.notify(peer, {
+      method: 'thread/settings/updated',
+      params: {
+        threadId,
+        threadSettings: {
+          cwd: thread.cwd,
+          approvalPolicy: thread.approvalPolicy ?? 'on-request',
+          approvalsReviewer: 'user',
+          sandboxPolicy: sandboxEnvelope(thread.sandboxMode, thread.cwd),
+          activePermissionProfile: activePermissionProfileId
+            ? { id: activePermissionProfileId, extends: null }
+            : null,
+          model: thread.model,
+          modelProvider: thread.modelProvider,
+          serviceTier: null,
+          effort: thread.reasoningEffort,
+          summary: null,
+          collaborationMode: {
+            mode: 'default',
+            settings: {
+              model: thread.model,
+              reasoning_effort: thread.reasoningEffort,
+              developer_instructions: thread.developerInstructions,
+            },
+          },
+          personality: thread.personality,
+        },
+      },
+    })
+    return {}
   }
 
   private threadRollback(params: Record<string, unknown>): unknown {
@@ -1350,8 +1442,21 @@ export class CodexClaudeAppServer {
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, thread.model)
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
+    const permissionProfileId = permissionProfileIdFromParams(params)
+    const permissionProfile = permissionProfilePolicy(permissionProfileId)
     if (model) thread.model = model
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
+    if (permissionProfileId) {
+      thread.permissionProfileId = permissionProfileId
+      if (permissionProfile?.approvalPolicy)
+        thread.approvalPolicy = permissionProfile.approvalPolicy
+      if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
+    } else {
+      if (typeof params.approvalPolicy === 'string')
+        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+      const requestedSandbox = sandboxFromTurnParams(params)
+      if (requestedSandbox) thread.sandboxMode = requestedSandbox
+    }
     this.store.upsertThread(thread)
     if (!thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
@@ -1649,11 +1754,15 @@ export class CodexClaudeAppServer {
     // the thread-level setting captured at start/resume. turn/start ships a
     // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
     // the simpler sandbox string. Both are honoured.
+    const permissionProfile = permissionProfilePolicy(permissionProfileIdFromParams(params))
     const approvalPolicy =
+      permissionProfile?.approvalPolicy ??
       (typeof params.approvalPolicy === 'string'
         ? normalizeApprovalPolicy(params.approvalPolicy)
-        : null) ?? thread.approvalPolicy
-    const sandboxMode = sandboxFromTurnParams(params) ?? thread.sandboxMode
+        : null) ??
+      thread.approvalPolicy
+    const sandboxMode =
+      permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params) ?? thread.sandboxMode
     // Per-turn instruction overrides: Codex App may resend its instruction
     // panel state when the user toggles personality mid-thread. Falls back to
     // whatever was captured at thread/start.
@@ -1712,6 +1821,36 @@ export class CodexClaudeAppServer {
       contexts: subagentContexts,
       active: activeSubagents,
     })
+    let acceptRuntimeEvents = true
+    let watchdogTimer: NodeJS.Timeout | null = null
+    let resolveWatchdog: (() => void) | null = null
+    const watchdogTimeoutMs = subagentWatchdogTimeoutMs()
+    const watchdogPromise =
+      watchdogTimeoutMs > 0
+        ? new Promise<void>((resolve) => {
+            resolveWatchdog = resolve
+          })
+        : null
+    const disarmWatchdog = (): void => {
+      if (watchdogTimer) clearTimeout(watchdogTimer)
+      watchdogTimer = null
+    }
+    const armWatchdog = (): void => {
+      if (!watchdogPromise || watchdogTimer || !acceptRuntimeEvents || activeSubagents.size === 0)
+        return
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = null
+        // Flip this before resolving the race so an already-buffered SDK event
+        // cannot create a fresh child after the watchdog has decided to fail.
+        acceptRuntimeEvents = false
+        resolveWatchdog?.()
+      }, watchdogTimeoutMs)
+      watchdogTimer.unref()
+    }
+    const turnIsActive = (): boolean =>
+      acceptRuntimeEvents &&
+      this.store.getTurn(turn.id)?.status === 'inProgress' &&
+      this.activeTurnByThread.get(thread.id) === turn.id
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -1739,6 +1878,11 @@ export class CodexClaudeAppServer {
       },
       {
         onEvent: async (event) => {
+          // Interrupts, watchdog expiry, and a peer reconnect can leave a few
+          // SDK messages queued after the server has terminalized the turn.
+          // They are stale and must never resurrect a child or an inProgress
+          // item in the Codex App.
+          if (!turnIsActive()) return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             return
@@ -1809,6 +1953,10 @@ export class CodexClaudeAppServer {
               codexSessionId: null,
             }
             this.store.upsertThread(childThread)
+            // Child notifications must follow the current parent peer. This
+            // matters after unix-daemon reconnects, when the old peer is gone
+            // before the child publishes its response.
+            this.activePeerByThread.set(childThreadId, peer)
             const childTurn: TurnRecord = {
               id: newId(),
               threadId: childThreadId,
@@ -1946,6 +2094,7 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, waitId)
             subagentContexts.set(event.toolUseId, subagentContext)
             activeSubagents.add(event.toolUseId)
+            armWatchdog()
             return
           }
           if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
@@ -2064,6 +2213,7 @@ export class CodexClaudeAppServer {
                 completedAtMs: nowMillis(),
               },
             })
+            if (activeSubagents.size === 0) disarmWatchdog()
             return
           }
           if (event.type === 'text_delta') {
@@ -2341,6 +2491,7 @@ export class CodexClaudeAppServer {
           }
         },
         onPermissionRequest: async (event) => {
+          if (!turnIsActive()) return { decision: 'cancel' }
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
             const item = this.toolUseToItem(
@@ -2372,6 +2523,7 @@ export class CodexClaudeAppServer {
             }
           }
           const decision = await this.requestApproval(peer, thread.id, turn.id, itemId, event)
+          if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'acceptForSession') {
             const command = String(event.input.command ?? '')
             if (command) {
@@ -2383,6 +2535,7 @@ export class CodexClaudeAppServer {
           return decision
         },
         onUserInputRequest: async (event) => {
+          if (!turnIsActive()) return { answers: {} }
           // Render AskUserQuestion as Codex's native dynamicToolCall item +
           // item/tool/requestUserInput reverse RPC. The App pops its
           // structured choice card; we wait for the answers, finalise the
@@ -2416,6 +2569,7 @@ export class CodexClaudeAppServer {
             item.id,
             event.questions,
           )
+          if (!turnIsActive()) return { answers: {} }
           const contentItems = userInputAnswersAsContent(event.questions, answers)
           const completedItem: ThreadItem = {
             ...item,
@@ -2439,21 +2593,53 @@ export class CodexClaudeAppServer {
         },
       },
     )
-    await runtimeTurn.then(
-      () => {
-        if (this.store.getTurn(turn.id)?.status === 'inProgress') {
-          this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
-        }
-        this.subagentStateByTurn.delete(turn.id)
-      },
-      (error: unknown) => {
-        if (this.store.getTurn(turn.id)?.status === 'inProgress') {
-          this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
-        }
-        this.subagentStateByTurn.delete(turn.id)
-        throw error
-      },
+    const runtimeOutcome = runtimeTurn.then(
+      () => ({ kind: 'resolved' as const }),
+      (error: unknown) => ({
+        kind: 'rejected' as const,
+        error: error instanceof Error ? error : new Error(String(error)),
+      }),
     )
+    const outcome = watchdogPromise
+      ? await Promise.race([
+          runtimeOutcome,
+          watchdogPromise.then(() => ({ kind: 'timeout' as const })),
+        ])
+      : await runtimeOutcome
+    disarmWatchdog()
+    acceptRuntimeEvents = false
+    if (outcome.kind === 'timeout') {
+      const timeoutSeconds = Math.ceil(watchdogTimeoutMs / 1000)
+      const timeoutUnit = timeoutSeconds === 1 ? 'second' : 'seconds'
+      const message = `Subagent did not publish a terminal result within ${timeoutSeconds} ${timeoutUnit}.`
+      if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+        this.finalizeOrphanedSubagents(
+          peer,
+          thread,
+          turn,
+          subagentContexts,
+          activeSubagents,
+          message,
+        )
+        this.subagentStateByTurn.delete(turn.id)
+        // Do not await the SDK interrupt here: some SDK versions wait for the
+        // same result that has just timed out. The server catch path will
+        // terminalize the parent turn immediately and late events are guarded.
+        void this.runtime.interrupt(thread.id).catch(() => {})
+      }
+      throw new Error(message)
+    }
+    if (outcome.kind === 'rejected') {
+      if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+        this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
+      }
+      this.subagentStateByTurn.delete(turn.id)
+      throw outcome.error
+    }
+    if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+      this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
+    }
+    this.subagentStateByTurn.delete(turn.id)
     const currentTurn = this.store.getTurn(turn.id)
     if (currentTurn && currentTurn.status !== 'inProgress') return
 
@@ -2616,7 +2802,11 @@ export class CodexClaudeAppServer {
       agentThreadId: context.childThreadId,
       agentPath: context.agentPath,
     }
-    this.store.appendItem(parentTurnId, item)
+    // Codex cc 26.818 rejects `kind: completed` when replaying history. The
+    // live notification is useful to newer clients, but the terminal wait
+    // item and child turn already carry the durable completion state, so keep
+    // the persisted representation legacy-safe.
+    if (kind !== 'completed') this.store.appendItem(parentTurnId, item)
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
   }
 
@@ -2659,6 +2849,7 @@ export class CodexClaudeAppServer {
     turn: TurnRecord,
     contexts: Map<string, SubagentContext>,
     active: Set<string>,
+    failureMessage = 'Subagent ended without a terminal task result.',
   ): void {
     for (const toolUseId of Array.from(active)) {
       const context = contexts.get(toolUseId)
@@ -2666,7 +2857,7 @@ export class CodexClaudeAppServer {
       contexts.delete(toolUseId)
       if (!context) continue
 
-      const message = 'Subagent ended without a terminal task result.'
+      const message = failureMessage
       const childTurn = this.completeSubagentChildTurn(peer, context, message, 'failed', {
         message,
       })
@@ -2808,7 +2999,6 @@ export class CodexClaudeAppServer {
     const requestedTurnId = stringOr(params.turnId, '')
     this.activePeerByThread.set(threadId, peer)
     const activeTurnId = this.activeTurnByThread.get(threadId)
-    const interrupting = this.runtime.interrupt(threadId)
     const turnId = activeTurnId || requestedTurnId
     if (turnId) {
       const turn = this.store.getTurn(turnId)
@@ -2834,6 +3024,11 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(threadId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
+    // Persist the terminal state before asking the SDK to abort. A few SDK
+    // versions deliver one or two buffered tool events during interrupt; the
+    // runRuntimeTurn guard now rejects them because the turn is no longer
+    // active, so they cannot create an orphan child after this point.
+    const interrupting = this.runtime.interrupt(threadId)
     await interrupting
     return {}
   }
@@ -3708,6 +3903,11 @@ export class CodexClaudeAppServer {
   }
 
   private threadEnvelope(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+    const activePermissionProfileId = threadPermissionProfileId(
+      thread.permissionProfileId,
+      thread.approvalPolicy,
+      thread.sandboxMode,
+    )
     return {
       thread: this.toThread(thread, turns),
       model: thread.model,
@@ -3719,7 +3919,13 @@ export class CodexClaudeAppServer {
       approvalsReviewer: 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
       permissionProfile: null,
-      activePermissionProfile: null,
+      activePermissionProfile: activePermissionProfileId
+        ? { id: activePermissionProfileId, extends: null }
+        : null,
+      // Some newer clients read the compact id while older clients use the
+      // structured activePermissionProfile field. Return both; unknown extra
+      // fields are ignored by the legacy app-server schema.
+      permissions: activePermissionProfileId,
       reasoningEffort: thread.reasoningEffort,
     }
   }
@@ -3947,7 +4153,39 @@ export class CodexClaudeAppServer {
   private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {
     const threadId = stringOr(asRecord(params).threadId, '')
     if (!threadId) return peer
-    return this.activePeerByThread.get(threadId) ?? peer
+    const direct = this.activePeerByThread.get(threadId)
+    if (direct) return direct
+    const seen = new Set<string>()
+    let current = this.store.getThread(threadId)
+    while (current?.forkedFromId && !seen.has(current.forkedFromId)) {
+      seen.add(current.forkedFromId)
+      const ancestorPeer = this.activePeerByThread.get(current.forkedFromId)
+      if (ancestorPeer) {
+        this.activePeerByThread.set(threadId, ancestorPeer)
+        return ancestorPeer
+      }
+      current = this.store.getThread(current.forkedFromId)
+    }
+    return peer
+  }
+
+  private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
+    const queue = [rootThreadId]
+    const seen = new Set<string>()
+    while (queue.length > 0) {
+      const parentId = queue.shift()
+      if (!parentId || seen.has(parentId)) continue
+      seen.add(parentId)
+      for (const child of this.store.listThreads({
+        includeEphemeral: true,
+        parentThreadId: parentId,
+        sortKey: 'created_at',
+        sortDirection: 'asc',
+      })) {
+        this.activePeerByThread.set(child.id, peer)
+        queue.push(child.id)
+      }
+    }
   }
 
   private loadPersistedConfig(): void {
