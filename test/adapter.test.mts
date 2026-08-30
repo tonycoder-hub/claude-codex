@@ -3214,8 +3214,8 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       .map((item: any) => item.kind)
     assert.deepEqual(
       liveActivityKinds,
-      ['completed'],
-      'same-process parent history must not retain a started activity marker',
+      [],
+      'same-process parent history must not retain capability-specific activity markers',
     )
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
@@ -3318,9 +3318,8 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
 
     // Restart the adapter and replay the parent turn from SQLite. The bundled
     // App reduces items in persisted order, so wait/completed must still be
-    // the last subagent state after a cold restart. `completed` activity is a
-    // live-only extension; the durable history stays compatible with Codex cc
-    // 26.818, whose schema only accepts started/interacted/interrupted.
+    // the last subagent state after a cold restart. Activity markers are
+    // live-only extensions; the durable history stays capability-neutral.
     const exited = once(proc, 'exit')
     proc.kill()
     await exited

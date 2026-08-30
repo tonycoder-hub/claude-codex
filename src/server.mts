@@ -2895,12 +2895,12 @@ export class CodexClaudeAppServer {
       agentThreadId: context.childThreadId,
       agentPath: context.agentPath,
     }
-    // The durable wait/child-turn state is enough while a modern peer is
-    // live. Persist only terminal activity for modern peers; replaying a
-    // persisted `started` marker after a same-process thread/read would make
-    // a completed child look active again. Legacy peers never receive the
-    // successful activity kinds and keep the existing interrupted marker.
-    if (kind !== 'started') this.store.appendItem(parentTurnId, item)
+    // Keep the persisted history capability-neutral. The durable wait and
+    // child-turn state covers live and completed runs; persisting either
+    // started or completed activity would make a mixed-version reconnect
+    // decode a kind the peer may not support. Interrupted remains the one
+    // legacy-safe terminal marker for abandoned children.
+    if (kind === 'interrupted') this.store.appendItem(parentTurnId, item)
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
   }
 
