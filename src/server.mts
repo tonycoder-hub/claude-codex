@@ -1,9 +1,8 @@
-import { homedir } from 'node:os'
-import { existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
@@ -376,7 +375,6 @@ export class CodexClaudeAppServer {
       case 'thread/goal/clear':
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
-      case 'thread/settings/update':
         return this.threadMetadataUpdate(asRecord(params))
       case 'thread/section/move':
         return this.threadSectionMove(asRecord(params))
@@ -458,15 +456,6 @@ export class CodexClaudeAppServer {
           // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
           // turns it off for environments where the tool is rate-limited.
           webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
-        }
-      case 'permissionProfile/list':
-        return {
-          data: [
-            { id: ':read-only', description: null, allowed: true },
-            { id: ':workspace', description: null, allowed: true },
-            { id: ':danger-full-access', description: null, allowed: true },
-          ],
-          nextCursor: null,
         }
       case 'experimentalFeature/list':
         return { data: [], nextCursor: null }
@@ -809,7 +798,7 @@ export class CodexClaudeAppServer {
           : parent.sandboxMode),
       permissionProfileId:
         permissionProfileIdFromParams(params) ??
-        (hasLegacyPermissionParams(params) ? null : parent.permissionProfileId ?? null),
+        (hasLegacyPermissionParams(params) ? null : (parent.permissionProfileId ?? null)),
       ephemeral: parent.ephemeral,
       threadSource:
         typeof params.threadSource === 'string'
@@ -913,12 +902,8 @@ export class CodexClaudeAppServer {
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
       nextCursor:
-        last && threads.length >= numberOr(params.limit, 50)
-          ? String(cursorValue(last))
-          : null,
-      backwardsCursor: threads[0]
-        ? String(cursorValue(threads[0]))
-        : null,
+        last && threads.length >= numberOr(params.limit, 50) ? String(cursorValue(last)) : null,
+      backwardsCursor: threads[0] ? String(cursorValue(threads[0])) : null,
     }
   }
 
@@ -952,7 +937,11 @@ export class CodexClaudeAppServer {
 
   private threadSectionCreate(params: Record<string, unknown>): unknown {
     const name = stringOr(params.name, '')
-    const section = this.store.createSection(newId(), name, this.sectionAppearance(params.appearance))
+    const section = this.store.createSection(
+      newId(),
+      name,
+      this.sectionAppearance(params.appearance),
+    )
     return { section }
   }
 
@@ -1194,7 +1183,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    
+
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const rawModel = modelFromParams(params, null)
     const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
@@ -2003,10 +1992,7 @@ export class CodexClaudeAppServer {
     const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     const resolvedModel = isCodexThread
       ? rawTurnModel
-      : resolveClaudeModel(
-          rawTurnModel,
-          params.outputSchema == null ? 'normal' : 'summary',
-        )
+      : resolveClaudeModel(rawTurnModel, params.outputSchema == null ? 'normal' : 'summary')
     const resolvedEffort = resolveClaudeEffort(
       typeof params.effort === 'string'
         ? params.effort
@@ -3943,7 +3929,8 @@ export class CodexClaudeAppServer {
     // Do not impose a default timeout on interactive/streaming terminal sessions (tty or streamStdin)
     const isInteractive = isTty || params.streamStdin === true
     const defaultTimeout = isInteractive ? 0 : 60_000
-    const timeoutMs = params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
+    const timeoutMs =
+      params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
     const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
 
     child.once('error', (error) => {

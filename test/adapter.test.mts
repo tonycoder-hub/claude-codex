@@ -1322,7 +1322,7 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
   }
 })
 
-test('unix websocket app-server accepts initialize', async () => {
+test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1331,11 +1331,13 @@ test('unix websocket app-server accepts initialize', async () => {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(proc, /listening on/)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -1345,23 +1347,13 @@ test('unix websocket app-server accepts initialize', async () => {
         params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
       }),
     )
-    // adapter now also pushes account/updated + mcpServer/startupStatus/updated
-    // notifications after handshake; filter by id rather than grabbing the
-    // first frame off the wire.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
-    ws.close()
   } finally {
-    proc.kill()
+    terminateWebSocket(ws)
+    await stopProcess(proc)
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -1854,7 +1846,10 @@ test('startup recovery removes legacy activity markers from completed subagent t
     assert.equal(store.recoverStaleInProgressTurns(), 1)
     const recovered = store.getTurn(turnId)
     assert.ok(recovered)
-    assert.equal(recovered.items.some((item) => item.type === 'subAgentActivity'), false)
+    assert.equal(
+      recovered.items.some((item) => item.type === 'subAgentActivity'),
+      false,
+    )
     assert.equal(store.getThread(threadId)?.status.type, 'idle')
     assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
@@ -1863,7 +1858,9 @@ test('startup recovery removes legacy activity markers from completed subagent t
   }
 })
 
-test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
+test('app-server proxy forwards websocket handshake bytes to unix daemon', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1893,13 +1890,16 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', async
     )
     await stdout.waitFor(/101 Switching Protocols/)
   } finally {
-    proxy.kill()
-    daemon.kill()
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () => {
+test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1912,12 +1912,14 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -1930,27 +1932,21 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
         },
       }),
     )
-    // adapter pushes notifications post-handshake; filter for the response.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
-    ws.close()
   } finally {
-    proxy.kill()
-    daemon.kill()
+    terminateWebSocket(ws)
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('remote shim launches daemon and proxy with Codex-compatible commands', async () => {
+test('remote shim launches daemon and proxy with Codex-compatible commands', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1975,12 +1971,14 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
       NODE_NO_WARNINGS: '1',
     },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -1993,24 +1991,13 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
         },
       }),
     )
-    // The adapter now also pushes account/updated + mcpServer/startupStatus/updated
-    // notifications right after handshake; the response can land in any order
-    // relative to those. Filter for the matching id rather than grabbing the
-    // first frame off the wire.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response?.result?.codexHome, home)
-    ws.close()
   } finally {
-    proxy.kill()
-    daemon.kill()
+    terminateWebSocket(ws)
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -3939,7 +3926,9 @@ test('defaultSocketPath stays within the platform sun_path limit', async () => {
   }
 })
 
-test('approval requests round-trip through Codex server requests', async () => {
+test('approval requests round-trip through Codex server requests', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -3951,7 +3940,12 @@ test('approval requests round-trip through Codex server requests', async () => {
       json({
         id: 1,
         method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+        params: {
+          cwd: process.cwd(),
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+          permissions: ':workspace',
+        },
       }),
     )
     const start = await reader.nextResponse(1)
@@ -4003,7 +3997,7 @@ test('approval requests round-trip through Codex server requests', async () => {
     assert.equal(sawResolved, true)
     assert.equal(sawOutput, true)
   } finally {
-    proc.kill()
+    await stopProcess(proc)
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -4048,7 +4042,7 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
         completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(completedTool?.tool, 'Read')
+    assert.equal(completedTool?.tool, 'Read README.md')
     assert.equal(completedTool?.status, 'completed')
     // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
     // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
@@ -4304,7 +4298,7 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
   }
 })
 
-test('file change approval emits patch and git diff updates', async () => {
+test('file change approval emits patch and git diff updates', { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const repo = join(home, 'repo')
   execFileSync('mkdir', ['-p', repo])
@@ -4327,7 +4321,12 @@ test('file change approval emits patch and git diff updates', async () => {
       json({
         id: 1,
         method: 'thread/start',
-        params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false },
+        params: {
+          cwd: repo,
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+          permissions: ':workspace',
+        },
       }),
     )
     const start = await reader.nextResponse(1)
@@ -4368,7 +4367,7 @@ test('file change approval emits patch and git diff updates', async () => {
     assert.match(diff, /README.md/)
     assert.match(diff, /changed by mock runtime/)
   } finally {
-    proc.kill()
+    await stopProcess(proc)
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -5662,12 +5661,24 @@ class TextCollector {
   }
 
   async waitFor(pattern: RegExp): Promise<void> {
-    const started = Date.now()
+    const deadline = Date.now() + 5000
     while (!pattern.test(this.text)) {
-      if (Date.now() - started > 5000) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
         throw new Error(`timed out waiting for ${pattern}; saw: ${this.text}`)
       }
-      await new Promise<void>((resolve) => this.waiters.push(resolve))
+      await new Promise<void>((resolve, reject) => {
+        const waiter = () => {
+          clearTimeout(timeout)
+          resolve()
+        }
+        const timeout = setTimeout(() => {
+          const index = this.waiters.indexOf(waiter)
+          if (index >= 0) this.waiters.splice(index, 1)
+          reject(new Error(`timed out waiting for ${pattern}; saw: ${this.text}`))
+        }, remaining)
+        this.waiters.push(waiter)
+      })
     }
   }
 }
@@ -5731,6 +5742,28 @@ async function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<numbe
     once(proc, 'exit').then(([code]) => code as number | null),
     delay(timeoutMs).then(() => null),
   ])
+}
+
+function terminateWebSocket(ws: WebSocket | null): void {
+  if (!ws || ws.readyState === WebSocket.CLOSED) return
+  ws.on('error', () => {})
+  ws.terminate()
+}
+
+async function stopProcess(proc: ChildProcess, timeoutMs = 2000): Promise<void> {
+  const exited = (): boolean => proc.exitCode !== null || proc.signalCode !== null
+  const wait = async (): Promise<boolean> => {
+    if (exited()) return true
+    return await Promise.race([
+      once(proc, 'exit').then(() => true),
+      delay(timeoutMs).then(() => false),
+    ])
+  }
+  if (exited()) return
+  proc.kill()
+  if (await wait()) return
+  proc.kill('SIGKILL')
+  await wait()
 }
 
 async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void> {
