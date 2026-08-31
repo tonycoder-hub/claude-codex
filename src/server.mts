@@ -1230,6 +1230,31 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
 
+    // Codex App sends model and effort changes through this RPC. Keep these
+    // legacy settings fields in the compatibility handler so removing the
+    // duplicate dispatch case does not silently disable profile/model
+    // switching for existing clients.
+    const rawModel = modelFromParams(params, null)
+    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
+    if (model) {
+      thread.runtimeBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
+      thread.model = model
+    }
+    const reasoningEffort = reasoningEffortFromParams(params, null)
+    if (reasoningEffort) thread.reasoningEffort = reasoningEffort
+    if (typeof params.personality === 'string')
+      thread.personality = normalizePersonality(params.personality)
+    const collaborationMode = asRecord(params.collaborationMode)
+    const collaborationSettings = asRecord(collaborationMode.settings)
+    const developerInstructions =
+      typeof collaborationSettings.developer_instructions === 'string'
+        ? collaborationSettings.developer_instructions
+        : typeof collaborationSettings.developerInstructions === 'string'
+          ? collaborationSettings.developerInstructions
+          : null
+    if (developerInstructions !== null)
+      thread.developerInstructions = nullIfEmpty(developerInstructions)
+
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
     if (permissionProfileId) thread.permissionProfileId = permissionProfileId

@@ -5913,3 +5913,55 @@ test('Codex section pin RPC moves a thread into and out of the reserved pinned s
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('thread/settings/update preserves model and effort compatibility', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const started = await reader.nextResponse(1)
+    const threadId = started.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/settings/update',
+        params: {
+          threadId,
+          model: 'haiku',
+          effort: 'xhigh',
+          personality: 'friendly',
+          collaborationMode: {
+            mode: 'default',
+            settings: { developer_instructions: 'keep settings compatibility' },
+          },
+        },
+      }),
+    )
+    let updated: any = null
+    let settingsNotification: any = null
+    for (let attempt = 0; attempt < 20 && (!updated || !settingsNotification); attempt += 1) {
+      const message = await reader.next()
+      if (message.id === 2 && message.method == null) updated = message
+      if (message.method === 'thread/settings/updated') settingsNotification = message
+    }
+    assert.ok(updated)
+    assert.deepEqual(updated.result, {})
+    assert.ok(settingsNotification)
+    assert.equal(settingsNotification.params.threadSettings.model, 'haiku')
+    assert.equal(settingsNotification.params.threadSettings.effort, 'xhigh')
+    assert.equal(settingsNotification.params.threadSettings.personality, 'friendly')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId } }))
+    const read = await reader.nextResponse(3)
+    assert.equal(read.result.model, 'haiku')
+    assert.equal(read.result.reasoningEffort, 'xhigh')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
