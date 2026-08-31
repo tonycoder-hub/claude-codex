@@ -32,6 +32,11 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/get',
     'thread/goal/clear',
     'thread/metadata/update',
+    'thread/section/move',
+    'threadSection/list',
+    'threadSection/create',
+    'threadSection/update',
+    'threadSection/delete',
     'thread/settings/update',
     'thread/memoryMode/set',
     'memory/reset',
@@ -5758,3 +5763,120 @@ async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void>
     proc.once('exit', onExit)
   })
 }
+
+test('thread/list honors isPinned and metadata updates persist the pin state', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env = { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' }
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const first = await reader.nextResponse(1)
+    const firstId = first.result.thread.id
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const second = await reader.nextResponse(2)
+    const secondId = second.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/metadata/update',
+        params: { threadId: firstId, isPinned: true },
+      }),
+    )
+    const updated = await reader.nextResponse(3)
+    assert.equal(updated.result.thread.isPinned, true)
+
+    proc.stdin.write(json({ id: 4, method: 'thread/list', params: { isPinned: true } }))
+    const pinned = await reader.nextResponse(4)
+    assert.deepEqual(
+      pinned.result.data.map((thread: any) => thread.id),
+      [firstId],
+    )
+
+    proc.stdin.write(json({ id: 5, method: 'thread/list', params: { isPinned: false } }))
+    const unpinned = await reader.nextResponse(5)
+    assert.deepEqual(
+      unpinned.result.data.map((thread: any) => thread.id),
+      [secondId],
+    )
+
+    proc.stdin.write(json({ id: 6, method: 'thread/list', params: {} }))
+    const all = await reader.nextResponse(6)
+    assert.deepEqual(
+      new Set(all.result.data.map((thread: any) => thread.id)),
+      new Set([firstId, secondId]),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('Codex section pin RPC moves a thread into and out of the reserved pinned section', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'threadSection/list', params: { limit: 100 } }))
+    const sections = await reader.nextResponse(2)
+    assert.equal(sections.error, undefined)
+    const pinnedSection = sections.result.data.find(
+      (section: any) => section.id === '01984de2-8f74-7c91-a3b2-5c5e937cf318',
+    )
+    assert.ok(pinnedSection)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/section/move',
+        params: { threadId, sectionId: pinnedSection.id, beforeThreadId: null },
+      }),
+    )
+    const moved = await reader.nextResponse(3)
+    assert.equal(moved.error, undefined)
+    assert.deepEqual(moved.result, {})
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId } }))
+    const pinned = await reader.nextResponse(4)
+    assert.equal(pinned.result.thread.isPinned, true)
+    assert.equal(pinned.result.thread.section.id, pinnedSection.id)
+
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'thread/list',
+        params: { sectionId: pinnedSection.id, sortKey: 'section_position' },
+      }),
+    )
+    const pinnedList = await reader.nextResponse(5)
+    assert.deepEqual(
+      pinnedList.result.data.map((thread: any) => thread.id),
+      [threadId],
+    )
+
+    proc.stdin.write(
+      json({ id: 6, method: 'thread/section/move', params: { threadId, sectionId: null } }),
+    )
+    const unpinned = await reader.nextResponse(6)
+    assert.equal(unpinned.error, undefined)
+
+    proc.stdin.write(json({ id: 7, method: 'thread/read', params: { threadId } }))
+    const afterUnpin = await reader.nextResponse(7)
+    assert.equal(afterUnpin.result.thread.isPinned, false)
+    assert.equal(afterUnpin.result.thread.section, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})

@@ -78,7 +78,7 @@ import {
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
-import type { SessionStore } from './store.mjs'
+import { PINNED_SECTION_ID, type SessionStore } from './store.mjs'
 import type {
   ClaudeRuntime,
   FileUpdateChange,
@@ -91,6 +91,7 @@ import type {
   RuntimeEvent,
   ThreadItem,
   ThreadRecord,
+  ThreadSectionAppearance,
   ThreadTokenUsage,
   TokenUsageBreakdown,
   TurnRecord,
@@ -377,6 +378,16 @@ export class CodexClaudeAppServer {
       case 'thread/metadata/update':
       case 'thread/settings/update':
         return this.threadMetadataUpdate(asRecord(params))
+      case 'thread/section/move':
+        return this.threadSectionMove(asRecord(params))
+      case 'threadSection/list':
+        return this.threadSectionList(asRecord(params))
+      case 'threadSection/create':
+        return this.threadSectionCreate(asRecord(params))
+      case 'threadSection/update':
+        return this.threadSectionUpdate(asRecord(params))
+      case 'threadSection/delete':
+        return this.threadSectionDelete(asRecord(params))
       case 'thread/settings/update':
         return this.threadSettingsUpdate(peer, asRecord(params))
       // Intentional no-ops: Claude Code has no equivalent concept, so the
@@ -632,6 +643,10 @@ export class CodexClaudeAppServer {
       id,
       sessionId: id,
       forkedFromId: null,
+      isPinned: false,
+      sectionId: null,
+      sectionEnteredAt: null,
+      sectionPosition: null,
       preview: '',
       name: null,
       archived: false,
@@ -770,6 +785,10 @@ export class CodexClaudeAppServer {
       id,
       sessionId: parent.sessionId,
       forkedFromId: parent.id,
+      isPinned: false,
+      sectionId: null,
+      sectionEnteredAt: null,
+      sectionPosition: null,
       archived: false,
       cwd,
       model: modelFromParams(params, parent.model),
@@ -854,14 +873,25 @@ export class CodexClaudeAppServer {
         ? params.ancestorThreadId
         : null
     const sortKey =
-      params.sortKey === 'updated_at' || params.sortKey === 'recency_at'
+      params.sortKey === 'updated_at' ||
+      params.sortKey === 'recency_at' ||
+      params.sortKey === 'section_position'
         ? params.sortKey
         : 'created_at'
     const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc'
+    const isPinned = typeof params.isPinned === 'boolean' ? params.isPinned : null
+    const sectionId =
+      params.sectionId === null
+        ? null
+        : typeof params.sectionId === 'string'
+          ? params.sectionId
+          : undefined
     const threads = this.store.listThreads({
       archived: (params.archived as boolean | null | undefined) ?? null,
       limit: numberOr(params.limit, 50),
       cursor: typeof params.cursor === 'string' ? params.cursor : null,
+      isPinned,
+      sectionId,
       cwd:
         typeof params.cwd === 'string' || Array.isArray(params.cwd)
           ? (params.cwd as string | string[])
@@ -874,15 +904,81 @@ export class CodexClaudeAppServer {
       sortDirection,
     })
     const last = threads.at(-1)
+    const cursorValue = (thread: ThreadRecord): number =>
+      sortKey === 'section_position'
+        ? (thread.sectionPosition ?? thread.createdAt)
+        : sortKey === 'created_at'
+          ? thread.createdAt
+          : thread.updatedAt
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
       nextCursor:
         last && threads.length >= numberOr(params.limit, 50)
-          ? String(sortKey === 'created_at' ? last.createdAt : last.updatedAt)
+          ? String(cursorValue(last))
           : null,
       backwardsCursor: threads[0]
-        ? String(sortKey === 'created_at' ? threads[0].createdAt : threads[0].updatedAt)
+        ? String(cursorValue(threads[0]))
         : null,
+    }
+  }
+
+  private threadSectionMove(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    if (params.sectionId !== null && typeof params.sectionId !== 'string')
+      throw new Error('sectionId must be a string or null')
+    const sectionId = params.sectionId === null ? null : params.sectionId
+    if (sectionId === '') throw new Error('sectionId must not be empty')
+    const beforeThreadId =
+      typeof params.beforeThreadId === 'string' && params.beforeThreadId.length > 0
+        ? params.beforeThreadId
+        : null
+    const moved = this.store.moveThreadToSection(threadId, sectionId, beforeThreadId)
+    debugLog('thread.section.moved', {
+      threadId,
+      sectionId: moved.sectionId ?? null,
+      isPinned: moved.isPinned === true,
+      beforeThreadId,
+    })
+    return {}
+  }
+
+  private threadSectionList(params: Record<string, unknown>): unknown {
+    const sections = this.store.listSections(
+      numberOr(params.limit, 100),
+      typeof params.cursor === 'string' ? params.cursor : null,
+    )
+    return { data: sections, nextCursor: null }
+  }
+
+  private threadSectionCreate(params: Record<string, unknown>): unknown {
+    const name = stringOr(params.name, '')
+    const section = this.store.createSection(newId(), name, this.sectionAppearance(params.appearance))
+    return { section }
+  }
+
+  private threadSectionUpdate(params: Record<string, unknown>): unknown {
+    const sectionId = stringOr(params.sectionId, '')
+    const existing = this.store.getSection(sectionId)
+    if (!existing) throw new Error(`unknown section: ${sectionId}`)
+    const name = typeof params.name === 'string' ? params.name : existing.name
+    const appearance =
+      params.appearance === undefined
+        ? existing.appearance
+        : this.sectionAppearance(params.appearance)
+    return { section: this.store.updateSection(sectionId, name, appearance) }
+  }
+
+  private threadSectionDelete(params: Record<string, unknown>): unknown {
+    this.store.deleteSection(stringOr(params.sectionId, ''))
+    return {}
+  }
+
+  private sectionAppearance(value: unknown): ThreadSectionAppearance | null {
+    if (value == null) return null
+    const record = asRecord(value)
+    return {
+      color: typeof record.color === 'string' ? record.color : null,
+      icon: typeof record.icon === 'string' ? record.icon : null,
     }
   }
 
@@ -1113,6 +1209,20 @@ export class CodexClaudeAppServer {
       thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string')
       thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (typeof params.isPinned === 'boolean') {
+      const currentlyPinned = thread.sectionId === PINNED_SECTION_ID || thread.isPinned === true
+      if (currentlyPinned !== params.isPinned) {
+        const moved = this.store.moveThreadToSection(
+          threadId,
+          params.isPinned ? PINNED_SECTION_ID : null,
+          null,
+        )
+        thread.isPinned = moved.isPinned
+        thread.sectionId = moved.sectionId
+        thread.sectionEnteredAt = moved.sectionEnteredAt
+        thread.sectionPosition = moved.sectionPosition
+      }
+    }
     if (typeof params.baseInstructions === 'string')
       thread.baseInstructions = nullIfEmpty(params.baseInstructions)
     if (typeof params.developerInstructions === 'string')
@@ -1925,7 +2035,6 @@ export class CodexClaudeAppServer {
     // CodexProxyRuntime consumes it as the resume id. In mock mode the
     // mock runtime handles everything regardless of model id — bypass the
     // codex-proxy override so unit tests stay deterministic.
-    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     this.subagentStateByTurn.set(turn.id, {
       thread,
       turn,
@@ -2039,6 +2148,10 @@ export class CodexClaudeAppServer {
               id: childThreadId,
               sessionId: thread.sessionId,
               forkedFromId: thread.id,
+              isPinned: false,
+              sectionId: null,
+              sectionEnteredAt: null,
+              sectionPosition: null,
               preview: promptText.slice(0, 200),
               name: null,
               archived: false,
@@ -4279,10 +4392,14 @@ export class CodexClaudeAppServer {
         : thread.sandboxMode === 'read-only'
           ? ':read-only'
           : ':workspace'
+    const section = thread.sectionId == null ? null : this.store.getSection(thread.sectionId)
+    const isPinned = thread.sectionId === PINNED_SECTION_ID || thread.isPinned === true
 
     return {
       id: thread.id,
-      isPinned: false,
+      isPinned,
+      section,
+      sectionEnteredAt: thread.sectionEnteredAt ?? null,
       sessionId: thread.sessionId,
       forkedFromId: thread.forkedFromId,
       parentThreadId,
