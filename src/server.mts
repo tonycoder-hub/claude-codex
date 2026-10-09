@@ -2280,6 +2280,9 @@ export class CodexClaudeAppServer {
   }
 
   private failRuntimeTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): void {
+    // stop() already settled every turn and closed the store; a runtime turn
+    // still unwinding (a slow final git diff) has nothing left to record.
+    if (this.stopped) return
     const turnId = turn.id
     const current = this.store.getTurn(turnId)
     if (current && current.status !== 'inProgress') return

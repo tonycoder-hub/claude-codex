@@ -2076,6 +2076,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
@@ -2086,6 +2088,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
@@ -5770,6 +5774,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
   const bin = join(home, 'bin')
   const diffStarted = join(home, 'git-diff-started')
   const diffRelease = join(home, 'git-diff-release')
+  const diffDone = join(home, 'git-diff-done')
   await mkdir(repo, { recursive: true })
   await mkdir(bin, { recursive: true })
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
@@ -5787,6 +5792,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
       '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
       "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",
+      '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_DONE"',
       '  exit 0',
       'fi',
       'exec "$CLAUDE_CODEX_REAL_GIT" "$@"',
@@ -5821,7 +5827,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
       const response = (id) => messages.find((message) => 'id' in message && message.id === id)
       const waitFor = async (condition) => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
           if (condition()) return
           await new Promise((resolve) => setTimeout(resolve, 5))
         }
@@ -5851,6 +5857,9 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
         params: { threadId, turnId },
       })
       writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      // Assert only once the diff has returned, so its late result is what
+      // gets checked rather than a loaded machine's slow fake git.
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_DONE))
       await new Promise((resolve) => setTimeout(resolve, 50))
 
       assert.equal(store.getTurn(turnId)?.status, 'interrupted')
@@ -5892,6 +5901,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
           CLAUDE_CODEX_REAL_GIT: realGit,
           CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: diffStarted,
           CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: diffRelease,
+          CLAUDE_CODEX_TEST_GIT_DIFF_DONE: diffDone,
         },
       },
     )
