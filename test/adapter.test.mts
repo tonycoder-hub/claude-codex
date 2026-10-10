@@ -3166,6 +3166,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     let childAgentMessageText = ''
     let childTurnCompleted: any = null
     let liveChildRead: any = null
+    let childTokenUsage: any = null
     let leakedInnerItems = 0
     const subagentActivityStarted = new Map<string, any>()
     const subagentActivities: any[] = []
@@ -3235,8 +3236,11 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
         if (message.params.threadId === threadId) break
         childTurnCompleted = message.params.turn
       }
+      if (message.method === 'thread/tokenUsage/updated' && message.params.threadId !== threadId)
+        childTokenUsage = message.params.tokenUsage
     }
-
+    // The `<usage>subagent_tokens: N` trailer becomes the child's usage.
+    assert.equal(childTokenUsage?.total.totalTokens, 4242)
     // Native V2 uses activity items for liveness and leaves wait/completed as
     // the final parent item. Closing an already-finished child makes older App
     // reducers discard that completed state and fall back to "started".
@@ -3407,6 +3411,11 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       childAgent.text,
       /subagent final summary/,
       'the real subagent body must still be there',
+    )
+    assert.equal(
+      childAgent.text,
+      'subagent final summary\n\n```\nindented detail\n```',
+      'the hand-back frame and its indentation should be gone',
     )
 
     // A reload replays the activity cards this client saw live, in order, so
