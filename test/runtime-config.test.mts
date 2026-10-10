@@ -128,10 +128,10 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   const buildOptions = Reflect.get(runtime, 'buildOptions')
   const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
   const options = buildOptions.call(runtime, {}, context, new AbortController(), () => session)
-  assert.deepEqual(options.settings, {
-    enableWorkflows: true,
-    workflowKeywordTriggerEnabled: true,
-  })
+  // Pinned launchers reject --settings, so workflows are enabled by env alone.
+  assert.equal(options.settings, undefined)
+  assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, '1')
+  assert.equal(options.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
   assert.equal(options.permissionMode, 'default')
   assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
@@ -232,6 +232,7 @@ test('workflow command parser keeps list and run semantics distinct', () => {
     new AbortController(),
   )
   assert.equal(options.settings, undefined)
+  assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, undefined)
 })
 
 test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministically', () => {
