@@ -2231,6 +2231,23 @@ export class CodexClaudeAppServer {
     // runs it as a slash command. The user message keeps the original input.
     const prompt = hiddenPrompt ?? skillLinksToCommand(textPrompt || textFromInput(input))
     const workflowCommand = hiddenPrompt ? null : parseWorkflowCommand(prompt)
+    // Like Codex, input that arrives while a turn is running joins that turn.
+    // A turn/start can race a turn the adapter has just opened itself (for a
+    // background agent's or workflow's report); a second turn would orphan
+    // it, and it would never complete.
+    const runningTurnId = this.activeTurnByThread.get(threadId)
+    if (
+      runningTurnId &&
+      !hiddenPrompt &&
+      params.outputSchema == null &&
+      this.store.getTurn(runningTurnId)?.status === 'inProgress'
+    ) {
+      if (workflowCommand?.type === 'list')
+        throw new Error('/workflows list can run once the current turn finishes')
+      await this.turnSteer(peer, { ...params, expectedTurnId: runningTurnId })
+      const running = this.store.getTurn(runningTurnId)
+      if (running) return { turn: this.toLifecycleTurn(running) }
+    }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, thread.model)
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
