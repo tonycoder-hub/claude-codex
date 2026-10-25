@@ -548,6 +548,76 @@ test('a document root without the host module is refused at startup', () => {
   );
 });
 
+/**
+ * Collect the lines the surface's own logger writes while a test runs.
+ *
+ * `buildSurface` builds its logger with `createLogger({ level })` and no
+ * `stream`, so process.stderr is the only place those lines can be observed --
+ * there is no seam to inject through and adding one would be a wider change
+ * than the thing being covered. The original is restored from `t.after`, which
+ * is registered before anything can throw, so a failing assertion cannot leave
+ * the runner writing into an array.
+ */
+function captureLog(t) {
+  const chunks = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => { chunks.push(String(chunk)); return true; };
+  t.after(() => { process.stderr.write = original; });
+  return (event) => chunks
+    .join('')
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.event === event);
+}
+
+const NO_ROOTS_EVENT = 'surface.no_workspace_roots';
+
+test('a surface with nowhere to work says so, rather than serving a screen no browser can leave', async (t) => {
+  // This is the repository's most expensive failure, written down: one unset
+  // environment variable, a renderer that paints its logo and sits on an
+  // onboarding screen whose only exit is a native folder picker, no failed
+  // request, no console error, nothing on the wire. Six chain drives to
+  // diagnose. `warnIfNowhereToWork` exists solely to announce it -- and it had
+  // zero references under test/, so replacing its body with `return` left the
+  // whole suite green. The guard against a silent degradation was itself
+  // unwatched.
+  //
+  // Driven through `buildSurface` rather than against the function, because
+  // the `if (archive) warnIfNowhereToWork(...)` call site and the real logger
+  // are as easy to delete as the body is.
+  const linesFor = captureLog(t);
+  const built = buildSurface(envIn(tempDir('relay-mount-'), {
+    CODEX_RELAY_ASAR: buildArchive(RENDERER),
+    CODEX_RELAY_LOG_LEVEL: 'warn',
+  }));
+  t.after(() => { built.archive.close(); return built.surface.close(); });
+
+  const warned = linesFor(NO_ROOTS_EVENT);
+  assert.equal(warned.length, 1, 'a surface with no workspace roots announced nothing');
+  assert.equal(warned[0].level, 'warn', 'info would be filtered out of exactly the deployment that needs it');
+  // The line is the only evidence there will be -- the phone just shows a logo
+  // -- so it has to be actionable on its own: it must name the variable to set
+  // and say what the operator is otherwise looking at.
+  assert.equal(warned[0].variable, 'CODEX_RELAY_WORKSPACE_ROOTS');
+  assert.match(warned[0].consequence, /onboarding/);
+});
+
+test('a surface that does have a workspace root does not cry wolf', async (t) => {
+  // The other half: a warning that fires unconditionally passes the test above
+  // and trains everyone to ignore the line.
+  const dir = tempDir('relay-mount-');
+  const linesFor = captureLog(t);
+  const built = buildSurface(envIn(dir, {
+    CODEX_RELAY_ASAR: buildArchive(RENDERER),
+    CODEX_RELAY_LOG_LEVEL: 'warn',
+    CODEX_RELAY_WORKSPACE_ROOTS: dir,
+  }));
+  t.after(() => { built.archive.close(); return built.surface.close(); });
+
+  assert.deepEqual(linesFor(NO_ROOTS_EVENT), [], 'a configured surface must not warn');
+});
+
 test('the default document root is the repository web/ directory', () => {
   // Pinned because every module under web/ reaches src/appserver by climbing
   // out with `../`, which only lands on the mount while web/ sits at `/`.

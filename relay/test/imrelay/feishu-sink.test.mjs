@@ -577,6 +577,116 @@ test('the shim refuses a route and a body it was not built for', async () => {
   }
 });
 
+/** One send through a live shim, as the daemon would phrase it. */
+function sendTo(endpoint, receiveId) {
+  return fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', [NONCE_HEADER]: NONCE },
+    body: JSON.stringify({
+      tool: CLI_TOOL,
+      args: {
+        action: 'send', send_as: 'user', receive_id_type: 'chat_id',
+        receive_id: receiveId, msg_type: 'text', content: '{"text":"hi"}',
+      },
+    }),
+  });
+}
+
+test('a chat id that merely resembles an allowed one is not an allowed chat', async () => {
+  // The allowlist comment calls itself a fuse: it is the last thing between a
+  // turn and the wrong group. So the only match it may make is equality.
+  //
+  // The file's one existing negative used `oc_the_internal_group`, an id with
+  // nothing in common with the allowed one. That distinguishes "exact hit"
+  // from "utterly unrelated" and nothing else, which means an entire class of
+  // bug -- the comparison quietly getting *looser* -- was invisible: replacing
+  // `chats.includes(id)` with `chats.some((c) => c.startsWith(id))` or with a
+  // `toLowerCase()` comparison left all 1748 tests green. Each id below is one
+  // such relaxation away from CHAT, and each is a plausible thing to write.
+  const stub = await stubCli('success');
+  const shim = await liveShim(stub);
+  try {
+    const nearMisses = [
+      ['oc_only', 'a strict prefix of an allowed id addresses a different chat (kills `startsWith`)'],
+      ['oc_only_me_and_the_team', 'an allowed id being a prefix of this one buys it nothing'],
+      ['OC_ONLY_ME', 'chat ids are compared byte for byte, never case-folded'],
+      [`${CHAT} `, 'trailing whitespace is not trimmed into a match at send time'],
+      [CHAT.slice(1), 'dropping a leading character does not land back inside the allowlist'],
+    ];
+    for (const [receiveId, why] of nearMisses) {
+      const response = await fetch(shim.endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [NONCE_HEADER]: NONCE },
+        body: JSON.stringify({
+          tool: CLI_TOOL,
+          args: {
+            action: 'send', send_as: 'user', receive_id_type: 'chat_id',
+            receive_id: receiveId, msg_type: 'text', content: '{"text":"hi"}',
+          },
+        }),
+      });
+      assert.equal(response.status, 403, why);
+      await response.text();
+      // The status is not the thing that matters. What matters is that no argv
+      // ever crossed into the CLI, because that -- not the HTTP code -- is what
+      // decides whether a message was addressed to a chat nobody allowed.
+      await assert.rejects(stub.received(), `${why}: nothing may have reached the CLI`);
+    }
+
+    // The positive control, last: without it every assertion above would still
+    // pass on a shim that had been broken into refusing everything.
+    const allowed = await sendTo(shim.endpoint, CHAT);
+    assert.equal(allowed.status, 200);
+    assert.deepEqual(await allowed.json(), { ok: true, messageId: 'om_real_1' });
+    assert.equal(JSON.parse((await stub.received())[2]).receive_id, CHAT);
+  } finally {
+    await shim.close();
+    await stub.cleanup();
+  }
+});
+
+test('an empty allowlist permits nothing, instead of failing open to every chat', async () => {
+  // The relay side has `an allowlist sink with no chats permits nothing`; the
+  // shim side had no equivalent, so `(chats.length > 0 && !chats.includes(id))`
+  // -- fail-open on an empty list -- survived the whole suite.
+  //
+  // `readConfig` does refuse an empty FEISHU_SHIM_CHATS (asserted below, and
+  // separately in the readConfig test), so this state is not reachable through
+  // the documented startup path. It is pinned anyway because `screen` and
+  // `createShim` are exported: the fuse must hold on its own terms rather than
+  // on another function elsewhere having been called first.
+  assert.throws(
+    () => readConfig({ FEISHU_SHIM_NONCE: NONCE, FEISHU_SHIM_CHATS: '' }),
+    /CHATS/,
+    'config must refuse an empty allowlist rather than start with one',
+  );
+
+  const stub = await stubCli('success');
+  const shim = await liveShim(stub, { chats: [] });
+  try {
+    for (const receiveId of [CHAT, 'oc_anything_at_all', '']) {
+      const response = await sendTo(shim.endpoint, receiveId);
+      assert.equal(response.status, 403, `${receiveId || '(empty)'} must be refused by an empty allowlist`);
+      await response.text();
+      await assert.rejects(stub.received(), 'an empty allowlist must not let anything reach the CLI');
+    }
+    // And at the policy function directly, so the refusal is attributable to
+    // the allowlist check rather than to some earlier shape check.
+    const good = {
+      tool: CLI_TOOL,
+      args: { action: 'send', send_as: 'user', receive_id_type: 'chat_id', receive_id: CHAT, content: '{}' },
+    };
+    assert.equal(screen(good, { chats: [CHAT], sendAs: 'user' }), null, 'premise: this body is otherwise fine');
+    const refused = screen(good, { chats: [], sendAs: 'user' });
+    assert.notEqual(refused, null, 'an empty allowlist must not permit the body it would otherwise permit');
+    assert.equal(refused.status, 403);
+    assert.match(refused.error, /allowlist/);
+  } finally {
+    await shim.close();
+    await stub.cleanup();
+  }
+});
+
 // -- layer 4: a relay in snapshot mode ---------------------------------------
 
 function snapshotRelay({
