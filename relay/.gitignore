@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+local.config.json
+
+# Scratch staging area. Patch scripts and pre-apply copies of modules live
+# here; a stale duplicate of web/host-namespaces.mjs was committed once by an
+# over-broad  and is exactly the kind of file someone edits by
+# mistake. Nothing here is the source of truth for anything.
+work/

@@ -1,0 +1,10 @@
+// One group, one person, the ordinary case: ask, watch the card fill in.
+{"at": 0,    "chat": "oc_demo", "from": "dev", "text": "/ai 看一下 relay 现在是什么状态"}
+// A second group at the same time: two lanes, two cards, no cross-talk.
+{"at": 300,  "chat": "oc_other", "from": "tongshi", "text": "/ai 帮我看个问题"}
+// Not addressed to the relay. With --require-command this is ignored.
+{"at": 900,  "chat": "oc_demo", "from": "dev", "text": "这条不是给 relay 的"}
+// Take the lane over by hand, then hand it back.
+{"at": 1200, "chat": "oc_demo", "from": "dev", "text": "/mine"}
+{"at": 1500, "chat": "oc_demo", "from": "dev", "text": "/ai 这条会被拒绝，因为我接管了"}
+{"at": 1900, "chat": "oc_demo", "from": "dev", "text": "/release"}

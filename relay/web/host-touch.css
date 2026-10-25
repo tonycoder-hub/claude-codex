@@ -1,0 +1,739 @@
+/* The touch adaptation for the real renderer, expressed as policy rather than
+ * as code.
+ *
+ * Everything in this file could have been done from JavaScript and should not
+ * be: a stylesheet re-evaluates itself on every resize, orientation change and
+ * keyboard open for free, while the equivalent script is a resize listener that
+ * has to be right about when to run. So the rule we followed is that CSS owns
+ * anything CSS can express, and web/host-touch.mjs is left with exactly the
+ * three things it cannot: a class on the <html> element, one attribute written
+ * onto an element React has not mounted yet, and a tap that has to become a
+ * message.
+ *
+ * TWO GATES, AND THEY ANSWER DIFFERENT QUESTIONS
+ *
+ *   @media (pointer: coarse)    "a finger is driving this"  -> hit areas, type
+ *                                                              size, the soft
+ *                                                              keyboard
+ *   @media (max-width: 767px)   "the viewport is narrow"    -> layout
+ *
+ * 767px is not a number we chose. The shipped stylesheet already carries a
+ * sidebar rule behind `@media not all and (width>=768px)`, so matching it is
+ * what keeps our layout block and the bundle's own responsive-sidebar mode
+ * switching on the same pixel instead of one pixel apart. A tablet in landscape
+ * is coarse but not narrow and gets the first set only, which is right: its
+ * sidebar fits.
+ *
+ * SELECTORS ARE STABLE OR THEY ARE NOT WRITTEN HERE
+ *
+ * The bundle's component classes are CSS-module hashes -- `_Layout_yl8z4_2`,
+ * `_ResponsiveLeftPanel_yl8z4_2`, `_Toolbar_11q0v_2`. The hash is a build
+ * output, so naming one here buys a selector that will silently match nothing
+ * after the next release: no error, no warning, just the mobile adaptation
+ * quietly gone. Every selector below is therefore one of
+ *
+ *   - a `data-app-shell-*` attribute the shell writes on its own frame,
+ *   - an unhashed global class (`app-shell-left-panel`, `sidebar-navigation`,
+ *     `ProseMirror`),
+ *   - an ARIA attribute, or
+ *   - a Tailwind group name, matched as a class token.
+ *
+ * test/web/host-touch.test.mjs fails if a hashed-looking selector ever appears
+ * in this file.
+ *
+ * WHY THERE IS SO MUCH `!important`
+ *
+ * The app-shell frame carries its layout as an INLINE style. Measured on the
+ * frame element in app-initial:
+ *
+ *   { "--spacing-token-safe-header-left": pt,
+ *     "--spacing-token-safe-header-right": mt,
+ *     width:  "calc(100vw / var(--codex-window-zoom))",
+ *     height: "calc(100svh / var(--codex-window-zoom))",
+ *     zoom:   "var(--codex-window-zoom)" }
+ *
+ * No author declaration of normal importance can reach a style attribute at any
+ * specificity, because the cascade sorts the style attribute above every other
+ * normal author declaration. An important one can, because important author
+ * declarations are sorted above all of them. So `!important` here is not
+ * emphasis and not a shortcut past a specificity fight -- it is the only
+ * mechanism that exists. It appears where a declaration has to beat an inline
+ * style, an `!important` the bundle itself ships, or an UNLAYERED bundle
+ * selector with genuinely more specificity than ours; nowhere else.
+ *
+ * CASCADE LAYERS, WHICH CHANGE THAT ANSWER AND USED TO BE MISSING FROM IT
+ *
+ * The served document's own inline style element opens with
+ *
+ *   @layer theme, base, components, utilities;
+ *
+ * and nearly every rule in the shipped stylesheets sits inside one of those
+ * four layers. This file declares no layer, which is now a position rather than
+ * an accident: an unlayered NORMAL declaration beats every layered normal
+ * declaration at any specificity. Our (0,0,1) `::after` really does outrank
+ * `@layer components ._Button_eg66f_2:after` at (0,1,1), and the sentence that
+ * used to stand here -- "at equal specificity we already win on source order"
+ * -- was describing a cascade this page does not have. Source order decides
+ * only between declarations in the SAME layer, and the bundle's layered rules
+ * are never in ours.
+ *
+ * What is left to lose against is the bundle's small unlayered tail: the
+ * `.electron-opaque` and `[data-codex-window-type=electron]` surface rules, the
+ * `.app-shell-left-panel` backgrounds at (0,4,0) and (0,6,0), and the inline
+ * style element's own `html,body{background:var(--startup-background)}`. Those
+ * share the unlayered bucket with this file, so against them specificity and
+ * source order are the whole story -- and they are where the `!important`s
+ * below are actually spent.
+ *
+ * For IMPORTANT declarations the layer order reverses: a layered important
+ * beats an unlayered one, and an earlier layer beats a later one. Section 2
+ * records the one place that costs us something.
+ *
+ * WHAT THIS FILE DELIBERATELY DOES NOT CONTAIN
+ *
+ * Hover-reveal affordances. `@media (hover: hover)` appears 77 times in the
+ * shipped stylesheet, so the bundle already guards them and a second opinion
+ * from us would only fight it.
+ */
+
+/* ---------------------------------------------------------------------------
+ * 1. The traffic-light inset: 98px of nothing, and not only on a phone.
+ *
+ * The inset derivation sniffs the user-agent string for `mac os x`
+ * INDEPENDENTLY of `codexOs`:
+ *
+ *   function Gqr(e,t){ ... let r=(n.userAgent??``).toLowerCase(), i=...;
+ *     return i.includes(`darwin`)||i.includes(`mac`)||r.includes(`mac os x`)
+ *          ||r.includes(`macintosh`) ? Uqr(r) : ... }
+ *
+ * Every iOS user-agent contains the words "like Mac OS X", so iOS takes the
+ * macOS branch. It then fails the version probe -- `Xqr=/mac os x (\d+)[_.](\d+)/i`
+ * finds no digits in an iPhone UA -- and falls through to
+ * `iH.mac.modern = {left:92, right:0}`. The frame turns that into
+ * `pt = \`${te.left/U + 6}px\`` = 98px of padding reserved for window controls
+ * that do not exist. On a 390px viewport that is a quarter of the screen.
+ *
+ * The replacement values are not invented: the `+ 6` in that expression is
+ * unconditional, so `6px` / `0px` is precisely what the same line computes when
+ * the platform has no window controls (`iH.default = {left:0, right:0}`).
+ *
+ * This rule is NOT behind a media query, and that is deliberate. The bundle
+ * entry hardcodes `codexWindowType = 'electron'` in every browser we serve, so
+ * it believes it is a frameless Electron window on a desktop too -- and no
+ * browser tab has traffic lights. The inset is wrong everywhere, not just on a
+ * phone.
+ * ------------------------------------------------------------------------- */
+
+[data-app-shell-frame] {
+  --spacing-token-safe-header-left: 6px !important;
+  --spacing-token-safe-header-right: 0px !important;
+}
+
+/* ---------------------------------------------------------------------------
+ * 2. App regions, which a browser has no idea what to do with.
+ *
+ * `-webkit-app-region: drag` is applied by 21 rules across 6 of the shipped
+ * stylesheets, including `_Toolbar_11q0v_2` -- a measured 390x46 strip across
+ * the top of a phone viewport. The property is a real WebKit property, not a
+ * vendor-prefixed no-op, and whether mobile WebKit swallows taps over a drag
+ * region is INFERRED here rather than measured: we had no device to test on.
+ * Neutralising it costs one rule and nothing else, so it ships regardless, with
+ * the uncertainty written down instead of hidden.
+ *
+ * The `!important` is required for the normal `drag` declarations, and it is
+ * NOT sufficient for all of them. Exactly one `-webkit-app-region: drag` in the
+ * shipped CSS carries `!important` -- `.\!draggable` -- and it lives in
+ * `@layer utilities`. Importance inverts the layer order, so that layered
+ * important declaration beats this unlayered one and an element carrying that
+ * utility class stays a drag region. Recorded rather than fixed: the only way
+ * to outrank it is to move this rule into `@layer theme`, which would drop
+ * every normal declaration in this file below all four of the bundle's layers
+ * to buy one class back.
+ * ------------------------------------------------------------------------- */
+
+* {
+  -webkit-app-region: no-drag !important;
+}
+
+/* ---------------------------------------------------------------------------
+ * 3. The frameless-window translucency, which a browser cannot composite.
+ *
+ * The bundle ships its own cure and it is unreachable here. Three UNLAYERED
+ * rules in app-shared-6fb15e58cd7f.css turn the translucency off:
+ *
+ *   [data-codex-window-type=electron].electron-opaque
+ *     {background-color:var(--app-color-background-surface-under);
+ *      background-image:none}
+ *   [data-codex-window-type=electron].electron-opaque body
+ *     {background-color:var(--app-color-background-surface-under);
+ *      --app-color-background-elevated-primary:
+ *          var(--app-color-background-elevated-primary-opaque);
+ *      background-image:none}
+ *   [data-codex-window-type=electron].electron-opaque :where([data-theme])
+ *     {--app-color-background-elevated-primary:
+ *          var(--app-color-background-elevated-primary-opaque)}
+ *
+ * and all three are gated on a class only Electron sets. web/host-touch.mjs
+ * used to add that class at module evaluation; it no longer does, because the
+ * renderer takes it straight back off. Measured in app-initial:
+ *
+ *   let [s,c] = useState(!1);
+ *   ...
+ *   L = () => { let e = document.querySelector('[data-codex-window-type="electron"]');
+ *               if (e) { if (s && !xg()) { e.classList.add(`electron-opaque`); return }
+ *                        e.classList.remove(`electron-opaque`) } };
+ *   useLayoutEffect(L, [s])
+ *
+ * `s` starts false, so the first layout effect after mount -- before the first
+ * paint anybody sees -- runs the `remove` branch over whatever we added.
+ *
+ * POSTING THE MESSAGE INSTEAD WAS THE OTHER CANDIDATE, AND IT IS WORSE. The
+ * only input that sets `s` is a subscription to the inbound
+ * `electron-window-opaque-surface-changed`, which is not one of the three types
+ * the renderer's bus buffers, so a message sent before React subscribes is
+ * dropped with no error -- and we cannot observe the subscription to know when
+ * it exists. The renderer's own switch arm for that type is an empty `break`,
+ * confirming the subscriber is the entire mechanism. There is also a second
+ * gate, `xg()`, whose definition we could not resolve through the chunk's
+ * re-export map, so even a delivered message is not certainly enough.
+ *
+ * So this stylesheet states the same three things without the class. Nothing is
+ * reasserted, nothing races a mount, and the values are the bundle's own tokens
+ * rather than colours we picked.
+ *
+ * WHAT THESE BEAT. The translucent value they replace is
+ * `--app-color-background-elevated-primary: color-mix(in oklab,
+ * var(--gray-fixed-0) 70%, transparent)`, declared in `@layer theme` under
+ * `@supports (color:color-mix(in lab, red, red))` -- so being unlayered is
+ * enough. The transparent page comes from the document's inline style element,
+ * `html,body{background:var(--startup-background)}` with
+ * `--startup-background: transparent`, which is unlayered at (0,0,1) against
+ * our (0,1,0) and (0,1,1).
+ *
+ * Not behind a media query, for the same reason as section 1: the bundle entry
+ * hardcodes `codexWindowType = 'electron'` in every browser we serve, so a
+ * desktop tab is exactly as translucent as a phone.
+ * ------------------------------------------------------------------------- */
+
+[data-codex-window-type='electron'] {
+  background-color: var(--app-color-background-surface-under);
+  background-image: none;
+}
+
+[data-codex-window-type='electron'] body {
+  background-color: var(--app-color-background-surface-under);
+  background-image: none;
+  --app-color-background-elevated-primary: var(--app-color-background-elevated-primary-opaque);
+}
+
+/* `:where()` mirrors the bundle's own third rule exactly, and the reason it
+ * needs a third rule at all is proximity: a custom property is resolved from
+ * the NEAREST ancestor that declares it, not the most specific one, so a theme
+ * scope that redeclares the elevated token would keep its translucent value for
+ * its whole subtree no matter what we put on `body`. */
+[data-codex-window-type='electron'] :where([data-theme]) {
+  --app-color-background-elevated-primary: var(--app-color-background-elevated-primary-opaque);
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. Touch policy: what changes because a finger is driving, at any width.
+ * ------------------------------------------------------------------------- */
+
+@media (pointer: coarse) {
+  :root {
+    /* The floor every platform's guidance agrees on, and the outset that lifts
+     * the measured 28x28 composer send button onto it: (44 - 28) / 2. */
+    --codex-touch-target: 44px;
+    --codex-touch-outset: 8px;
+  }
+
+  /* Hit areas.
+   *
+   * 19 controls measured under 44x44 on a phone viewport. The expansion is an
+   * `::after` overlay rather than padding because padding moves paint: these
+   * are icon buttons with a background, and growing the box grows the visible
+   * pill. An absolutely-positioned overlay with a negative inset adds hit area
+   * and paints nothing.
+   *
+   * WHAT THE BUNDLE'S OWN `::after` DOES TO THIS, CORRECTED
+   *
+   * The selector list is wrapped in `:where()` to keep its specificity at zero.
+   * This comment used to go on to claim that the bundle's own button
+   * pseudo-elements therefore win any collision outright, which was wrong in
+   * the direction that hides a defect. The bundle's rule is
+   *
+   *   @layer components ._Button_eg66f_2:after{
+   *     border-radius:inherit; content:""; pointer-events:none;
+   *     display:block; position:absolute; inset:0}
+   *
+   * `:after` and `::after` are the same pseudo-element, so that rule and ours
+   * cascade together on ONE box. It is layered and we are not, so our (0,0,1)
+   * `inset` beats its (0,1,1) `inset: 0` and the box is enlarged exactly as
+   * intended. `pointer-events: none`, though, is a property we never declared:
+   * nothing competed with it and it applied to the enlarged box as well. Every
+   * control the Button component renders -- most of the toolbar -- had a hit
+   * area that was bigger and could not be hit. `pointer-events: auto` is the
+   * whole fix. The property is inherited and defaults to `auto`, so on a
+   * control with no bundle `:after` the declaration changes nothing.
+   *
+   * CONSEQUENCE WE ACCEPT, now that the direction of the cascade is known:
+   * `._Button_eg66f_2:focus-visible:after{outline:2px solid
+   * var(--button-ring-color,var(--color-ring));
+   * outline-offset:var(--button-ring-offset,2px)}` draws the focus ring on this
+   * same pseudo-element, so the ring follows our box and sits 8px further out
+   * than it was designed to. Suppressing it would delete a focus indicator,
+   * which is a worse defect than an oversized one.
+   *
+   * WHY ANCHORS ARE IN THE LIST ONLY WHEN THEY CARRY AN `aria-label`
+   *
+   * This arm used to be a bare `a[href]`, which matches the links inside chat
+   * prose. Those are inline boxes in a line of text, and the line spacing is
+   * measured rather than assumed: `._MarkdownRoot_176oq_2` sets
+   * `--markdown-line-height: calc(var(--markdown-font-size) * var(--leading-relaxed))`
+   * with `--leading-relaxed: 1.625`, and the auto-zoom block below pins
+   * `--codex-chat-font-size` to 16px, so paragraph lines are 26px apart around a
+   * content box of roughly 16-18px. That leaves about 4-5px of half-leading on
+   * each side of a link and an 8px outset does not fit in it: the overlay
+   * reaches into the line above and the line below, where it swallows taps
+   * aimed at ordinary words. A link that WRAPS is worse -- the containing block
+   * for an absolutely positioned child of an inline box is the bounding box of
+   * that box's first and last fragments, so the overlay becomes one rectangle
+   * spanning both lines and every word between them.
+   *
+   * Neither fault is about anchors; both are about inline layout, and `a[href]`
+   * was the only arm that routinely matched an inline box. WCAG 2.5.8 carves
+   * out the same exception for the same reason, excluding targets inline in a
+   * sentence or block of text from the minimum-size rule. `[aria-label]`
+   * separates the two populations without naming a hashed class: a prose link
+   * is named by the text inside it, so an anchor whose accessible name has to
+   * come from an attribute is an icon link -- the measured
+   * `Button({href, "aria-label":o, size:"iconCircle"})` is one -- which is
+   * precisely the small square target this sweep exists for.
+   *
+   * The expansion is expressed as `inset`, never as width/height, for the same
+   * reason: a bundle rule that sets `inset` replaces ours wholesale instead of
+   * combining with it into an over-constrained box.
+   *
+   * WHAT THE OUTSET DELIVERS, MEASURED -- AND WHERE IT DELIVERS NOTHING
+   *
+   * The arithmetic above, (44 - 28) / 2, is exact only for a control with no
+   * border, and the shipped buttons are split on that. A drive against the
+   * real renderer at 390x844 read each pseudo-element's own box:
+   *
+   *   Send                     28x28  ->  44x44    no border
+   *   Toggle side panel        28x28  ->  42x42    1px border
+   *   Change permissions       30x28  ->  44x42    1px border top and bottom
+   *
+   * The missing 2px is a containing-block rule rather than a mistake in the
+   * numbers: an absolutely positioned pseudo-element is laid out against its
+   * originating element's PADDING box, so a border is subtracted from each
+   * side before the negative inset is applied. CSS gives a pseudo-element no
+   * way to refer to its own element's border width, and `inset`, negative
+   * margins and percentage widths all resolve against that same padding box,
+   * so the rule cannot be made to inflate the border box. `--codex-touch-
+   * target` is therefore honestly a threshold that selects which controls need
+   * help, not a promise about the result: a bordered 28px control ends up at
+   * 42px, two under the floor and fourteen over where it started.
+   *
+   * The same rule has a harder consequence. A pseudo-element is clipped by its
+   * originating element before any ancestor sees it, so a control that
+   * truncates its own label -- `overflow: hidden` -- clips the outset away on
+   * all four sides and the expansion delivers nothing at all. One control on
+   * the home screen is in that state: the composer's project chip, 144x28 with
+   * `overflow: hidden`, whose four sides all measure as clipped with the probe
+   * point inside the computed box.
+   *
+   * This comment used to say that nothing in a stylesheet reaches past a clip.
+   * That is false, and the correction is worth keeping, because the real
+   * reason to leave the chip alone is a different one. `overflow: clip` with
+   * `overflow-clip-margin: 8px` moves the clip edge out by exactly the outset.
+   * Measured in the Chrome that drives this, on a 144x28 chip: all four sides
+   * go from missing to hit, and the label still truncates.
+   *
+   * What stops it is that the property cannot be added on its own. A clip
+   * margin is inert on `overflow: hidden`, which is a scroll container -- the
+   * four sides stay missing with the margin set -- and inert on
+   * `overflow: visible`, where an absolutely positioned child stays visible
+   * and hit-testable either way. `overflow` itself has to change to `clip`,
+   * and CSS cannot match on computed overflow. So the switch would have to be
+   * blanket, turning every control that legitimately overflows into a clipping
+   * one, or aimed at the chip through a shipped class name, which breaks on
+   * the next renderer build. Script classifying controls at mount would work,
+   * and is more machinery in the page than one control's tap height is worth.
+   *
+   * It also has a dependency. With no ellipsis the 8px margin paints 32 pixels
+   * of label past the box edge -- counted off a screenshot, not reasoned
+   * about. With `text-overflow: ellipsis` it paints none, because the ellipsis
+   * lands at the content box and nothing reaches the margin. So the working
+   * form is `overflow: clip` plus margin plus ellipsis, all three, on controls
+   * a stylesheet cannot name. `overflow-clip-margin-block`, which would have
+   * confined the change to the one axis that is actually short, is not
+   * supported in that Chrome.
+   *
+   * The chip is reachable at 144x28 -- the drive measures `smallDead: 0` --
+   * and short of the guideline on one axis by 16px. So the drive reports it as
+   * `clipped`, names the clipping element, and leaves it alone.
+   *
+   * KNOWN TRADE-OFF: in a dense toolbar, expanded hit areas overlap, and the
+   * later sibling wins the overlap. A row of icon buttons 4px apart therefore
+   * ends up with its effective tap centres pulled slightly to one side. That is
+   * inherent to enlarging hit areas without enlarging the buttons, and 8px was
+   * chosen over a full 44px square to keep the overlap small.
+   */
+  :where(button, [role='button'], [role='tab'], [role='menuitem'], [role='switch'], a[href][aria-label]) {
+    position: relative;
+  }
+
+  :where(button, [role='button'], [role='tab'], [role='menuitem'], [role='switch'], a[href][aria-label])::after {
+    content: '';
+    position: absolute;
+    inset: calc(var(--codex-touch-outset) * -1);
+    pointer-events: auto;
+  }
+
+  /* The send button, named separately because it is the only submit path.
+   *
+   * On a coarse pointer the composer deliberately routes Enter to a newline:
+   *
+   *   function hPc(){ return !navigator.platform.startsWith(`Win`)
+   *                        && window.matchMedia(`(pointer: coarse)`).matches }
+   *   Enter: (e,t)=>{ ... if (... || hPc()) return <insert newline> ... }
+   *
+   * leaving `Mod-Enter` as the only keyboard submit, and a soft keyboard has no
+   * Mod key. That is correct behaviour, not a bug -- which is exactly why we do
+   * not synthesise KeyboardEvents into ProseMirror. There is a real
+   * `<button aria-label="Send">`, present in all six recorded runs, and the
+   * only thing wrong with it is that it is 28x28. So it gets its own rule with
+   * real specificity, so that it is enlarged even if some bundle `::after`
+   * outranks the zero-specificity sweep above, and the arithmetic is left in
+   * the declaration so the measurement stays visible.
+   *
+   * Its `disabled` state is untouched on purpose: the button is disabled
+   * exactly when no project has been chosen, which is a different gap with a
+   * different fix.
+   */
+  [aria-label='Send'] {
+    position: relative;
+  }
+
+  [aria-label='Send']::after {
+    content: '';
+    position: absolute;
+    inset: calc((var(--codex-touch-target) - 28px) / -2);
+    /* The send button is a Button, so its `:after` carries the layered
+     * `pointer-events: none` described above. Without this line the one submit
+     * path on a coarse pointer has a 44x44 hit area that ignores taps. */
+    pointer-events: auto;
+  }
+
+  /* Panel resizers.
+   *
+   * Measured markup: `<div role="separator" aria-orientation="..."
+   * class="group/panel-resizer absolute flex touch-none select-none ...">`. A
+   * 4px-wide col-resize drag handle cannot be operated by touch at all, and it
+   * sits between two panels where it does nothing but steal taps meant for
+   * either side. Both variants are absolutely or fixed positioned, so removing
+   * them from flow changes no layout.
+   *
+   * `group/panel-resizer` is a Tailwind group NAME, part of the utility
+   * contract rather than a hashed module class, which is why it survives a
+   * rebuild. It is matched as a class token so that the `/` needs no escaping.
+   */
+  [class~='group/panel-resizer'] {
+    display: none !important;
+  }
+
+  /* iOS auto-zoom on focus.
+   *
+   * Mobile Safari zooms the whole page when a field with a font-size under 16px
+   * takes focus, and the default UI size is 14px. The bundle ships a
+   * first-class hook for exactly this:
+   *
+   *   --codex-chat-font-size: var(--codex-chat-font-size-override,
+   *                               var(--font-ui-size, 13px))
+   *
+   * and its own chrome-extension build already drives it
+   * (`[data-codex-window-type=chrome-extension]{--codex-chat-font-size-override:
+   * var(--font-ui-size); ...}`), so this is the sanctioned lever rather than a
+   * selector we invented.
+   *
+   * The second rule is the backstop for every other field. `max(16px, 1em)`
+   * cannot shrink anything -- `1em` is the inherited size -- so it raises the
+   * fields that are too small and leaves the rest alone. It is important
+   * because the composer is sized by more specific hashed rules, and a field
+   * under 16px on iOS is a functional defect rather than a style preference.
+   * `.ProseMirror` (119 rules in the shipped sheet) and
+   * `[data-composer-markdown]` (26) are both unhashed.
+   */
+  :root {
+    --codex-chat-font-size-override: 16px;
+    --codex-chat-code-font-size-override: 14px;
+  }
+
+  .ProseMirror,
+  [data-composer-markdown],
+  [data-composer-code-block],
+  textarea,
+  input:not([type='checkbox']):not([type='radio']):not([type='range']) {
+    font-size: max(16px, 1em) !important;
+  }
+
+  /* The soft keyboard.
+   *
+   * Three heights are still on `svh` -- `body{height:100svh}`, `#root{height:
+   * 100svh}` and the frame's inline `calc(100svh / var(--codex-window-zoom))`
+   * -- against 103 uses of `dvh` elsewhere in the shipped stylesheets, so this
+   * is filling in three gaps rather than overruling a decision. `svh` is the
+   * SMALL viewport: it is defined not to shrink when the keyboard appears. Add
+   * `[data-codex-window-type=electron] body{overflow:hidden}` and the result is
+   * that the composer and its send button sit below the fold with no way to
+   * scroll to them -- and by the note above, that button is the only way to
+   * send a message. `dvh` does shrink, on iOS 16.4+ and every current Chrome.
+   *
+   * Only the frame needs `!important`; the other two heights are ordinary
+   * author rules that our later source order already beats.
+   */
+  body,
+  #root {
+    height: 100dvh;
+  }
+
+  [data-app-shell-frame] {
+    height: calc(100dvh / var(--codex-window-zoom, 1)) !important;
+  }
+
+  /* Safe-area insets.
+   *
+   * The shipped stylesheet applies `env(safe-area-inset-bottom)` in nine leaf
+   * components and nothing at all to the shell, so this is the missing root
+   * inset rather than a duplicate of it.
+   *
+   * It is live now, and it was written before the thing that makes it live.
+   * Without `viewport-fit=cover` in the document's viewport meta, iOS
+   * letterboxes the page instead of extending it under the insets and every
+   * `env(safe-area-inset-*)` resolves to 0 -- so this block did nothing at the
+   * time it was added. src/renderer/boot.mjs now appends that token to the
+   * shipped meta when it patches the document, which turns this rule on.
+   *
+   * That order was the whole point. The opposite one -- the meta first, the
+   * padding later -- ships a composer under the home indicator in between, on
+   * every phone, for however long the gap lasts.
+   *
+   * Safe because the shipped Tailwind preflight sets
+   * `*,::after,::before,::backdrop{box-sizing:border-box}`, so the padding
+   * comes out of the frame's own height and width rather than adding to them.
+   *
+   * DIVIDED BY THE ZOOM, because this is the one element in the document that
+   * carries one. The frame's inline style is
+   *
+   *   { width:  "calc(100vw / var(--codex-window-zoom))",
+   *     height: "calc(100svh / var(--codex-window-zoom))",
+   *     zoom:   "var(--codex-window-zoom)" }
+   *
+   * and the bundle divides every length in it for a reason: a length declared
+   * on a zoomed element is rendered at length x zoom. `env(safe-area-inset-*)`
+   * is resolved by the user agent against the real viewport and is already in
+   * device-correct CSS pixels, so applying it here undivided reserves
+   * inset x zoom -- 51px of home-indicator padding at a 1.5 zoom instead of 34,
+   * and 23px at 0.67, which is under the indicator. The height rule just above
+   * already divides for exactly this reason; these two did not, which is the
+   * defect. The `, 1` fallback is belt and braces: the bundle declares
+   * `:root{--codex-window-zoom:1}` unlayered, so the variable is always set.
+   */
+  [data-app-shell-frame] {
+    padding-block-end: calc(env(safe-area-inset-bottom, 0px) / var(--codex-window-zoom, 1));
+    padding-inline: calc(env(safe-area-inset-left, 0px) / var(--codex-window-zoom, 1))
+      calc(env(safe-area-inset-right, 0px) / var(--codex-window-zoom, 1));
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. Layout: what changes because the viewport is narrow.
+ *
+ * The problem, measured: the sidebar takes 240 of 390 available pixels and
+ * crushes the conversation to about 150. 240 is not a coincidence, it is the
+ * panel's own default (`b = u === void 0 ? 240 : u`, `minimumWidth`).
+ *
+ * The bundle HAS a responsive-sidebar mode for this and it is dead-coded off:
+ * the frame's props carry a hardcoded `"data-app-shell-responsive-sidebar":!1`
+ * alongside `"data-app-shell-frame":!0`, on the same element, and the stylesheet
+ * behind it is
+ *
+ *   @media not all and (width>=768px){
+ *     ._Layout_yl8z4_2[data-app-shell-responsive-sidebar=true]{
+ *                                       --app-shell-left-panel-width:0px}
+ *     ._Layout_yl8z4_2[data-app-shell-responsive-sidebar=true]
+ *                      ._ResponsiveLeftPanel_yl8z4_2{display:none}
+ *     ._Layout_yl8z4_2[data-app-shell-responsive-sidebar=true]
+ *                      ._MainContentLeftBorder_yl8z4_2{border-left:0}}
+ *
+ * so web/host-touch.mjs flips that attribute to `true` and lets the bundle's
+ * own three declarations do the work. That is the lever we used, and it is
+ * strictly better than reproducing those selectors here, because two of the
+ * three are hashed. `_ResponsiveLeftPanel_yl8z4_2` does reach the panel: it is
+ * applied whenever `collapsible` is true, which is its default
+ * (`v = s === void 0 || s`).
+ *
+ * WHAT THE BUILT-IN MODE DOES NOT DO, and why this section exists anyway:
+ *
+ *   (a) It never brings the sidebar back. There is no mobile drawer for this
+ *       window type -- the only "Close sidebar" label in the bundle is gated on
+ *       `sidebarTriggerState === 'browser-popover'`, and the genuine overlay
+ *       panel (`data-testid="app-shell-floating-left-panel"`, `fixed bottom-0
+ *       left-0 z-[42]`) renders on an `isVisible` prop fed by the hover-peek
+ *       atom, which no host message reaches. So the overlay half is ours.
+ *   (b) The main content's inset is animated through a framer-motion value, not
+ *       through `--app-shell-left-panel-width`, and the attribute does not
+ *       reach it. Making the panel `position: fixed` takes it out of flow in
+ *       BOTH states, which is a second and independent guarantee that it cannot
+ *       push anything -- and it is the reason this section would still stop the
+ *       crush even if the attribute never landed.
+ *
+ * The open/closed state is read from `data-app-shell-sidebar-open`, which the
+ * frame already publishes next to the attribute we set, from the same atom the
+ * panel itself reads. So the existing toggle button -- and an inbound
+ * `toggle-sidebar` from our own helpers -- drives this with no JavaScript of
+ * ours in the path.
+ * ------------------------------------------------------------------------- */
+
+@media (max-width: 767px) {
+  /* Read by a fixed mobile-only toolbar the bundle positions at
+   * `start-[calc(var(--app-shell-left-panel-width)+var(--spacing)*2)]`. With
+   * the panel now an overlay, that offset has to collapse or the toolbar starts
+   * 240px into a 390px screen. No `!important`: the only rule that sets this is
+   * `._Layout_yl8z4_2`, which we match in specificity and follow in source
+   * order. */
+  [data-app-shell-frame] {
+    --app-shell-left-panel-width: 0px;
+
+    /* One source of truth for the drawer's width, because two rules now have to
+     * agree about it to the pixel: the drawer itself, and the scrim, which has
+     * to stop exactly where the drawer starts. Declared on the frame so the
+     * panel and its pseudo-elements inherit it. */
+    --codex-mobile-drawer-width: min(86vw, 320px);
+  }
+
+  [data-app-shell-frame] .app-shell-left-panel {
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: 0;
+    /* The stratum the bundle already reserves for a floating sidebar (`z-[42]`
+     * on its own overlay panel), so we are not inventing a new layer to be
+     * wrong about. */
+    z-index: 42;
+
+    /* `!important`, and specificity is the only reason. The bundle ships,
+     * UNLAYERED,
+     *
+     *   [data-codex-window-type=electron]:not([data-codex-window-chrome=application-menu])
+     *     :is([data-app-shell-frame][data-app-shell-workspace-tab-chrome],
+     *         [data-app-shell-page-surface=true])
+     *     .app-shell-left-panel:not([data-app-shell-left-panel-appearance=content-surface])
+     *       {background:0 0}
+     *
+     * at (0,6,0) against the (0,2,0) of this rule -- and `background: 0 0` is
+     * the SHORTHAND, so it sets a background-position and resets every other
+     * background longhand, background-color included, to its initial
+     * transparent. A `background-color` declaration cannot win that on
+     * specificity at any selector we are willing to write. The sibling rule at
+     * (0,4,0) is barely better: under
+     * `@supports (color:color-mix(in lab, red, red))` it paints
+     * `color-mix(in srgb, var(--color-surface-tertiary) 70%, transparent)`,
+     * which is 70% opaque on purpose because a real frameless window has the
+     * desktop behind it. On a phone it is a drawer you read the conversation
+     * through. Importance outranks both.
+     *
+     * The colour is the bundle's own opaque sidebar token --
+     * `--color-surface-tertiary: var(--app-color-background-editor-opaque)` --
+     * with the previous value kept as the fallback chain. */
+    background-color: var(--color-surface-tertiary, var(--color-surface, canvas)) !important;
+  }
+
+  /* The bundle bleeds the panel's background past the panel's own right edge:
+   *
+   *   [data-codex-window-type=electron]:not(...)
+   *     .app-shell-left-panel:not(...):after
+   *       {inset:0 calc(-1 * var(--radius-2xl)) 0 auto;
+   *        width:var(--radius-2xl); background:inherit; content:"";
+   *        pointer-events:none; position:absolute}
+   *
+   * a seam filler for the desktop layout, where the panel abuts rounded
+   * content. `background: inherit` made it invisible for as long as the panel's
+   * own background was transparent, so the declaration above is what turns it
+   * into a `--radius-2xl`-wide opaque stripe floating over the scrim. This is
+   * not an unrelated tidy-up, it is the other half of that fix. No `!important`
+   * is needed because that rule declares no `display` for ours to fight. */
+  [data-app-shell-frame] .app-shell-left-panel::after {
+    display: none;
+  }
+
+  [data-app-shell-frame][data-app-shell-sidebar-open='false'] .app-shell-left-panel {
+    display: none !important;
+  }
+
+  /* `!important` on `display` because the declaration it has to beat is the
+   * bundle's own `._Layout_yl8z4_2[data-app-shell-responsive-sidebar=true]
+   * ._ResponsiveLeftPanel_yl8z4_2{display:none}`, which carries more
+   * specificity than any stable selector we are willing to write. `!important`
+   * on the widths because in responsive mode the panel's animated width is
+   * zero and it arrives as an inline style. */
+  [data-app-shell-frame][data-app-shell-sidebar-open='true'] .app-shell-left-panel {
+    display: flex !important;
+    width: var(--codex-mobile-drawer-width) !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    opacity: 1 !important;
+    /* Divided by the zoom for the reason the safe-area block in section 4
+     * spells out: this padding is inside the frame's inline `zoom` too, so an
+     * undivided `env()` reserves inset x zoom at the bottom of the drawer. */
+    padding-block-end: calc(env(safe-area-inset-bottom, 0px) / var(--codex-window-zoom, 1));
+  }
+
+  /* The scrim.
+   *
+   * It is a pseudo-element on the panel rather than an element of our own, and
+   * that is a stacking decision, not a convenience. A separate scrim appended
+   * to <body> sits in a different stacking context from a panel nested inside
+   * the frame -- the frame carries an inline `zoom`, whose effect on the
+   * containing block for fixed-position descendants differs between engines --
+   * so the two z-indexes would not be reliably comparable and the scrim could
+   * paint over the drawer it is supposed to sit behind. As the panel's own
+   * `::before` with `z-index: -1` it is inside the panel's stacking context by
+   * construction: always behind the drawer, always in front of everything else.
+   *
+   * It also absorbs taps, because it belongs to a panel that is
+   * `pointer-events-auto`, so a mis-aimed tap lands on the sidebar instead of
+   * on the conversation behind it. Turning such a tap into a close is the one
+   * part of this that needs a listener, and it lives in web/host-touch.mjs.
+   *
+   * WHY IT STOPS AT THE DRAWER'S EDGE INSTEAD OF SPANNING THE VIEWPORT
+   *
+   * `z-index: -1` puts this pseudo-element behind the panel's CONTENT and in
+   * front of the panel's own BACKGROUND. That is painting order, not a wrong
+   * number: within the stacking context the panel establishes, CSS 2.1
+   * Appendix E paints the context element's own background and borders at step
+   * 1 and its negative-z-index child stacking contexts at step 2, ahead of any
+   * in-flow descendant. So an `inset: 0` scrim laid 45% black over every pixel
+   * of the drawer's own background -- which reads as a translucent drawer and
+   * is indistinguishable, by eye, from the specificity defect fixed above.
+   * Insetting the scrim to begin where the drawer ends removes the overlap
+   * instead of reordering the paint, so the question stops arising. The
+   * `z-index: -1` stays because it is still what keeps the scrim behind the
+   * sidebar's own content if the drawer is ever narrower than its contents.
+   */
+  [data-app-shell-frame][data-app-shell-sidebar-open='true'] .app-shell-left-panel::before {
+    content: '';
+    position: fixed;
+    inset-block: 0;
+    inset-inline: var(--codex-mobile-drawer-width) 0;
+    z-index: -1;
+    background-color: rgb(0 0 0 / 45%);
+  }
+
+  /* The navigation fills the drawer rather than keeping its 240px desktop
+   * width inside a wider one. `sidebar-navigation` is an unhashed global
+   * class, and its background already comes from the bundle. */
+  [data-app-shell-frame][data-app-shell-sidebar-open='true'] .app-shell-left-panel .sidebar-navigation {
+    width: 100%;
+  }
+}

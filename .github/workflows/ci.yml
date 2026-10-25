@@ -26,6 +26,18 @@ jobs:
       - run: npm run typecheck   # tsc --noEmit
       - run: npm test            # build + node --test (Node 24 has stable node:sqlite)
 
+  # The relay/ subtree is plain .mjs with zero dependencies, so it needs no
+  # install step and is not covered by `check`/`typecheck`/`test` above --
+  # those are scoped to src/ and test/. Without this job it would have no CI.
+  relay-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm run test:relay
+
   cargo-test:
     runs-on: ubuntu-latest
     steps:
