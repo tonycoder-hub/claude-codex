@@ -1,0 +1,295 @@
+/* Minimal on purpose.
+ *
+ * This is route C: an honest, unstyled surface to prove the chain works. No
+ * attempt is made to resemble the Codex app -- a half-imitation would be worse
+ * than plain. The only ambitions here are: readable at a phone's default font
+ * size, reachable one-handed, and correct in both colour schemes. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --bg-sunken: #f2f2f4;
+  --fg: #1a1a1c;
+  --fg-muted: #65656d;
+  --line: #d8d8dd;
+  --accent: #2f5fd0;
+  --danger: #b3261e;
+  --warn: #8a5a00;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --bg-sunken: #1f1f25;
+    --fg: #e9e9ec;
+    --fg-muted: #9a9aa4;
+    --line: #34343c;
+    --accent: #7aa2f7;
+    --danger: #f2807a;
+    --warn: #e0b341;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  /* The platform's own UI font: nothing to download, correct on every device. */
+  font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  /* Keep text selectable but stop iOS inflating it in landscape. */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ---- shared ---- */
+
+.muted { color: var(--fg-muted); font-size: 0.8rem; }
+.warn { color: var(--warn); }
+.mono { font-family: var(--mono); font-size: 0.8rem; }
+.note { color: var(--fg-muted); font-size: 0.9rem; margin: 0.5rem 0; }
+
+button {
+  font: inherit;
+  padding: 0.7rem 1rem;
+  /* 44px is the smallest comfortable tap target on a phone. */
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  color: var(--fg);
+}
+button:disabled { opacity: 0.45; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+button.small { min-height: 32px; padding: 0.25rem 0.6rem; font-size: 0.8rem; }
+
+input, textarea {
+  font: inherit;
+  width: 100%;
+  padding: 0.6rem;
+  min-height: 44px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+/* 16px minimum, or iOS Safari zooms the whole page when the field is focused. */
+input, textarea { font-size: max(16px, 1rem); }
+input[hidden], span[hidden], button[hidden], div[hidden], section[hidden] { display: none !important; }
+
+/* ---- login ---- */
+
+.screen { padding: 1.25rem; padding-bottom: max(1.25rem, env(safe-area-inset-bottom)); }
+#login h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+#login .primary { width: 100%; margin-top: 0.5rem; }
+.panel {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 0.6rem;
+}
+.panel h2 { font-size: 1rem; margin: 0; }
+
+/* ---- chat shell ----
+ * A grid with one scrolling row, so the composer and the approval panel stay
+ * put while only the transcript moves. dvh rather than vh: the dynamic unit
+ * tracks the phone's collapsing address bar. */
+
+.screen-chat {
+  display: grid;
+  grid-template-rows: auto auto auto 1fr auto auto;
+  height: 100dvh;
+  padding: 0;
+}
+
+.bar {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.5rem 0.75rem;
+  padding-top: max(0.5rem, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-sunken);
+}
+.bar-row { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.bar-row-quiet { gap: 0.6rem; }
+.thread-label { font-size: 0.8rem; color: var(--fg-muted); }
+
+.pill {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.pill-quiet { color: var(--fg-muted); }
+
+/* Connection state is colour-coded, but the text says it too -- colour alone
+ * would be a lie to anyone who cannot see it. */
+#connection[data-phase="live"] { border-color: #2e7d32; color: #2e7d32; }
+#connection[data-phase="connecting"],
+#connection[data-phase="reconnecting"] { border-color: var(--warn); color: var(--warn); }
+#connection[data-phase="dead"],
+#connection[data-phase="offline"] { border-color: var(--danger); color: var(--danger); }
+
+/* A blocked turn is stated in the header too, not only in the panel below. */
+#turnState[data-waiting="true"] {
+  border-color: var(--warn);
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ---- transcript ---- */
+
+.transcript {
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.item {
+  border-left: 3px solid var(--line);
+  padding-left: 0.6rem;
+}
+.item-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
+.item-kind { text-transform: lowercase; letter-spacing: 0.02em; }
+.item-meta { font-family: var(--mono); overflow-wrap: anywhere; }
+
+.item-body {
+  /* pre-wrap so model output keeps its own line breaks without any markup. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-top: 0.15rem;
+}
+.item-body:empty { display: none; }
+.item-body-pre { font-family: var(--mono); font-size: 0.8rem; }
+
+/* Enough difference to follow the shape of a turn at a glance. */
+.item-agentMessage { border-left-color: var(--accent); }
+.item-reasoning { border-left-color: var(--fg-muted); }
+.item-reasoning .item-body { color: var(--fg-muted); font-style: italic; }
+.item-commandExecution { border-left-color: var(--warn); }
+.item-commandExecution .item-body {
+  background: var(--bg-sunken);
+  padding: 0.5rem;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.item-fileChange { border-left-color: #2e7d32; }
+.item-userMessage { border-left-color: var(--fg); }
+
+/* A still-streaming item gets a quiet caret, so "working" is visible per item. */
+.item-open .item-kind::after {
+  content: " ▍";
+  animation: blink 1.1s steps(2, start) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .item-open .item-kind::after { animation: none; }
+}
+
+.item-changes:empty { display: none; }
+.change-path { font-family: var(--mono); font-size: 0.75rem; margin-top: 0.4rem; overflow-wrap: anywhere; }
+.change-diff {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  margin: 0.2rem 0 0;
+  padding: 0.5rem;
+  background: var(--bg-sunken);
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.plan, .errors { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); font-size: 0.85rem; }
+.plan-title { color: var(--fg-muted); font-size: 0.75rem; }
+.plan-list { margin: 0.25rem 0 0; padding-left: 1.2rem; }
+.plan-step { overflow-wrap: anywhere; }
+.plan-completed { color: var(--fg-muted); text-decoration: line-through; }
+.plan-inProgress { font-weight: 600; }
+.errors { color: var(--danger); }
+.error-line { overflow-wrap: anywhere; }
+
+.jump {
+  justify-self: center;
+  margin: 0.25rem auto;
+  width: fit-content;
+}
+
+/* ---- approvals ----
+ * A blocked turn is the one thing that must never be missed, so this panel is
+ * outside the scrolling area and visually loud. */
+
+.approvals {
+  border-top: 2px solid var(--warn);
+  background: var(--bg-sunken);
+  padding: 0.75rem;
+  max-height: 50dvh;
+  overflow-y: auto;
+}
+.approval + .approval { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+.approval-title { font-size: 0.95rem; margin: 0 0 0.4rem; }
+.approval-command {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  margin: 0;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.approval-meta { color: var(--fg-muted); font-size: 0.8rem; margin-top: 0.3rem; overflow-wrap: anywhere; }
+.approval-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.6rem; }
+.approval-actions button { flex: 1 1 auto; }
+.decision-accept { background: var(--accent); border-color: var(--accent); color: #fff; }
+.decision-decline, .decision-cancel { color: var(--danger); border-color: var(--danger); }
+
+.question { margin-top: 0.5rem; }
+.question-header { font-size: 0.75rem; color: var(--fg-muted); }
+.question-text { margin-bottom: 0.4rem; }
+.question-options { display: grid; gap: 0.3rem; }
+.question-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.4rem;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.question-option input { width: auto; min-height: 0; }
+.question-label { overflow-wrap: anywhere; }
+.question-desc { grid-column: 2; color: var(--fg-muted); font-size: 0.8rem; }
+.question-free { margin-top: 0.4rem; }
+
+/* ---- composer ---- */
+
+.composer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  padding-bottom: max(0.6rem, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--bg-sunken);
+}
+.composer textarea { resize: none; }
+.composer-actions { display: grid; gap: 0.35rem; align-content: start; }
+.composer-actions button { min-width: 5.5rem; }

@@ -1,0 +1,15 @@
+{
+  "name": "codex-relay-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A passkey-gated web relay that serves the real Codex App UI to a phone, driving a resident desktop instance with minimal invasiveness.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

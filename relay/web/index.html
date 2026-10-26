@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- interactive-widget keeps the composer above the phone keyboard instead of
+     letting it slide under; viewport-fit covers the home-bar inset. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Codex Relay</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<!-- Login / enrolment -->
+<main id="login" class="screen" hidden>
+  <h1>Codex Relay</h1>
+  <p id="loginNote" class="note"></p>
+
+  <button id="loginButton" type="button" class="primary">Sign in with a passkey</button>
+
+  <section id="enrollPanel" class="panel">
+    <h2>Enrol this device</h2>
+    <p class="note">Needs the single-use link shown on the resident machine, or an existing session.</p>
+    <input id="tokenInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off"
+           spellcheck="false" placeholder="enrolment token">
+    <input id="labelInput" type="text" autocomplete="off" placeholder="device name (optional)">
+    <button id="enrollButton" type="button" class="primary">Create a passkey</button>
+  </section>
+</main>
+
+<!-- Chat -->
+<div id="chat" class="screen screen-chat" hidden>
+  <header class="bar">
+    <div class="bar-row">
+      <span id="connection" class="pill" data-phase="offline">offline</span>
+      <span id="turnState" class="pill pill-quiet">idle</span>
+      <span id="tokens" class="pill pill-quiet" hidden></span>
+      <button id="reconnect" type="button" class="small" hidden>Retry</button>
+    </div>
+    <div class="bar-row bar-row-quiet">
+      <span id="sessionLabel" class="muted"></span>
+      <span id="threadId" class="muted mono"></span>
+      <span id="dropped" class="muted warn" hidden></span>
+    </div>
+    <div class="bar-row">
+      <label class="thread-label" for="threadInput">thread</label>
+      <input id="threadInput" type="text" class="mono" autocomplete="off" autocapitalize="off"
+             spellcheck="false" placeholder="start a new thread, or paste an id to resume">
+    </div>
+  </header>
+
+  <div id="plan" class="plan" hidden></div>
+  <div id="errors" class="errors" hidden></div>
+
+  <main id="transcript" class="transcript" aria-live="polite" aria-label="Conversation"></main>
+
+  <button id="jump" type="button" class="jump" hidden>Jump to latest</button>
+
+  <!-- Approvals block the turn, so they sit above the composer where they
+       cannot be scrolled away from. -->
+  <div id="approvals" class="approvals" role="alertdialog" aria-label="Waiting for your decision" hidden></div>
+
+  <form id="composer" class="composer">
+    <textarea id="input" rows="2" placeholder="Message… (⌘/Ctrl + Enter to send)"
+              autocapitalize="sentences" autocomplete="off"></textarea>
+    <div class="composer-actions">
+      <button id="send" type="submit" class="primary">Send</button>
+      <button id="stop" type="button" class="danger" disabled>Stop</button>
+    </div>
+  </form>
+</div>
+
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>
