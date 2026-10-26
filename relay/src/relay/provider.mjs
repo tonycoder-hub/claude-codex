@@ -131,6 +131,14 @@ export async function startProvider(provider, { target, logger = silentLogger } 
   return {
     kind: handle.kind,
     publicUrl: handle.publicUrl,
+    // Carried through rather than dropped, because the caller cannot do its
+    // one safety check without it: a provider that publishes us under a name
+    // of its own choosing (tailscale does) decides which origin a passkey will
+    // be validated against, and the relying party was pinned into the
+    // credential store before this provider ever started. `null` where a
+    // provider has no opinion -- the shape of the field has to be the same for
+    // every provider or every reader of it grows a branch.
+    webauthnRpId: typeof handle.webauthnRpId === 'string' && handle.webauthnRpId !== '' ? handle.webauthnRpId : null,
     async stop() {
       if (stopped) return;
       stopped = true;

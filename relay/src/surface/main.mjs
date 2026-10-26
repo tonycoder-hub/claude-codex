@@ -21,6 +21,8 @@ import { Ceremonies } from '../auth/ceremony.mjs';
 import { CredentialStore, EphemeralStore } from '../auth/store.mjs';
 import { SessionManager } from '../auth/session.mjs';
 import { KeyRing, defaultKeyStore } from '../auth/keys.mjs';
+import { selectProvider, startProvider } from '../relay/provider.mjs';
+import { INGRESS_ENV, resolveIngressConfig } from '../relay/provider-config.mjs';
 
 // Takes `env` rather than reading process.env, because buildSurface's whole
 // signature is a promise that configuration is injectable, and this function
@@ -306,6 +308,101 @@ export function buildRendererMount(env, logger = createLogger({ level: 'error' }
   };
 }
 
+/**
+ * Choose the ingress, before anything binds a port.
+ *
+ * Construction only -- nothing is dialled, spawned or read from a credential
+ * here. That is what makes it safe to do this early, and doing it early is the
+ * point: every provider checks what it can at construction (an ssh remote
+ * port, a relay url, a Funnel mode), so a
+ * mistyped variable is a refusal before the surface listens rather than a
+ * surprise after a phone is already waiting on it.
+ *
+ * Two log lines and nothing in between, because there is no third case:
+ * `surface.ingress_defaulted` means nobody asked for a route and this process
+ * is reachable from this machine only; `surface.ingress_selected` means one was
+ * named. Neither line carries an option value -- CODEX_RELAY_RELAY_TOKEN is a
+ * secret and `variables` is names only.
+ */
+export function buildIngress(env = process.env, logger = createLogger({ level: 'error' })) {
+  const { name, options, defaulted, variables } = resolveIngressConfig(env);
+  // Reached by name, so a provider's own construction refusal is the one that
+  // comes out -- the registry is a lookup, not a layer.
+  const provider = selectProvider(name, options);
+  if (defaulted) {
+    logger.info?.('surface.ingress_defaulted', {
+      variable: INGRESS_ENV,
+      provider: name,
+      consequence: 'the surface is reachable from this machine only; the url it reports is real and no phone can dial it',
+    });
+  } else {
+    logger.info?.('surface.ingress_selected', { provider: name, shape: provider.shape, variables });
+  }
+  return { name, provider, defaulted, variables };
+}
+
+/**
+ * Point the chosen ingress at a surface that is already listening.
+ *
+ * The target carries what *both* shapes need -- the server object for an
+ * outbound-multiplexing provider, host and port for a listener-configuring one
+ * -- which is legal because validateTarget only checks the fields its own
+ * shape uses. One target, either shape, no branch here on which we got.
+ *
+ * The relying-party check is the reason this function exists rather than three
+ * lines in main(). A provider of the tailscale sort publishes this machine
+ * under a name it chooses, and that name *is* the WebAuthn origin; the relying
+ * party, meanwhile, was pinned into the credential store the first time this
+ * surface ever ran. If the two disagree, every passkey enrolled from here is
+ * registered against an origin the browser will never validate -- and nothing
+ * fails, nothing logs, the page just refuses to sign in forever. So the
+ * mismatch is caught here, the provider is stopped, and the process refuses to
+ * run. It cannot be caught any earlier: the name does not exist until the
+ * provider has started.
+ */
+export async function startIngress({ ingress, surface, rpId = null, logger = createLogger({ level: 'error' }) }) {
+  const addr = surface.address();
+  if (!addr) {
+    throw new Error('startIngress needs a listening surface: call surface.listen() before pointing an ingress at it');
+  }
+  const host = addr.address;
+  const target = {
+    // The identity this machine should be reachable as, which is the relying
+    // party and not the provider's name: it is the one name in this process
+    // that a browser has already been told to expect. Providers that need a
+    // name of their own take it from their own options -- the relay's end name
+    // is CODEX_RELAY_RELAY_END, required for exactly that reason -- so this is
+    // a fallback and never an override.
+    name: rpId,
+    server: surface.server,
+    host,
+    port: addr.port,
+    // Bracketed so the string is dialable as written, the same way the loopback
+    // provider does it. This one is a hint reported to a relay's `/ends`.
+    url: `http://${host.includes(':') ? `[${host}]` : host}:${addr.port}`,
+  };
+
+  const handle = await startProvider(ingress.provider, { target, logger });
+
+  if (rpId && handle.webauthnRpId && handle.webauthnRpId !== rpId) {
+    await handle.stop();
+    throw new Error(
+      `the ${ingress.name} ingress publishes this machine as ${handle.webauthnRpId}, but the relying party pinned in the `
+      + `credential store is ${rpId}. A passkey enrolled now would be registered against an origin the browser will never `
+      + 'validate, and nothing would report it -- the sign-in would simply never succeed. Re-pin CODEX_RELAY_RP_ID and '
+      + 'CODEX_RELAY_RP_ORIGIN on a fresh state directory, or choose an ingress that does not rename this machine.',
+    );
+  }
+
+  logger.info?.('surface.ingress_started', {
+    provider: ingress.name,
+    kind: handle.kind,
+    publicUrl: handle.publicUrl,
+    webauthnRpId: handle.webauthnRpId,
+  });
+  return handle;
+}
+
 export function buildSurface(env = process.env) {
   const logger = createLogger({ level: env.CODEX_RELAY_LOG_LEVEL || 'info' });
   const stateDir = resolve(env.CODEX_RELAY_STATE || './state');
@@ -333,6 +430,11 @@ export function buildSurface(env = process.env) {
     bootstrapTokens: new EphemeralStore({ ttlMs: 10 * 60 * 1000 }),
     sessions,
   });
+
+  // Before createSurface, and before anything listens: a mistyped ingress
+  // variable should cost a refusal on startup, not a port that is bound and
+  // unreachable.
+  const ingress = buildIngress(env, logger);
 
   const staticRoot = env.CODEX_RELAY_STATIC ? resolve(env.CODEX_RELAY_STATIC) : DEFAULT_STATIC_ROOT;
   const { archive, archiveMounts } = buildRendererMount(env, logger);
@@ -368,12 +470,27 @@ export function buildSurface(env = process.env) {
   // It is null unless CODEX_RELAY_ASAR was set, and the three existing keys are
   // unchanged, so every caller that destructures what it already destructured
   // is unaffected.
-  return { surface, ceremonies, origin: credentials.relyingParty.origin, archive };
+  //
+  // `ingress` is the chosen provider, not a started one: starting it needs a
+  // listening socket, which buildSurface deliberately does not create. `rpId`
+  // comes along because startIngress has to compare it against what the
+  // provider publishes, and reading it back out of the store is what keeps that
+  // comparison about the pinned value rather than the environment's.
+  return {
+    surface,
+    ceremonies,
+    origin: credentials.relyingParty.origin,
+    archive,
+    ingress,
+    rpId: credentials.relyingParty.id,
+    logger,
+  };
 }
 
 export async function main() {
-  const { surface, ceremonies, origin, archive } = buildSurface();
+  const { surface, ceremonies, origin, archive, ingress, rpId, logger } = buildSurface();
   await surface.listen();
+  const ingressHandle = await startIngress({ ingress, surface, rpId, logger });
   announceEnrolment({ ceremonies, origin });
   process.on('SIGUSR1', () => announceEnrolment({ ceremonies, origin, force: true }));
   let stopping = false;
@@ -385,7 +502,15 @@ export async function main() {
       // until nothing is streaming from it, so an in-flight renderer asset
       // finishes rather than reading from a recycled fd number.
       archive?.close();
-      surface.close().then(() => process.exit(0), () => process.exit(1));
+      // The ingress goes down before the surface does: it is the thing holding
+      // a socket to somebody else's process (a relay, an ssh remote, a Funnel
+      // child), and leaving that attached while our own server shuts down
+      // publishes an end that answers nothing. `stop()` is idempotent by the
+      // wrapper in startProvider, so a second signal cannot double-stop it.
+      ingressHandle.stop()
+        .catch((err) => logger.error?.('surface.ingress_stop_failed', { message: err.message }))
+        .then(() => surface.close())
+        .then(() => process.exit(0), () => process.exit(1));
     });
   }
   return surface;
